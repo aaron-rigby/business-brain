@@ -209,343 +209,344 @@ with main_tab1:
     with col4:
         if st.button("🔍 Search Intelligence", use_container_width=True):
             st.session_state.active_tab = "search"
-
-if st.button("🔍 Search All Intelligence", type="primary", use_container_width=True):
-    with st.spinner("Analyzing your query..."):
-        if search_query:
-            try:
-                query_lower = search_query.lower()
-                
-                # 1. STATISTICAL QUERIES - Count, totals, numbers
-                if any(word in query_lower for word in ['how many', 'count', 'total', 'number of', 'amount', 'quantity']):
-                    stats = clients['index'].describe_index_stats()
-                    total_count = stats.get('total_vector_count', 0)
-                    
-                    st.success(f"📊 **Answer:** You have **{total_count} meetings** indexed in your Business Brain")
-                    
-                    # Provide additional context
-                    st.info(f"""
-                    📈 **Quick Stats:**
-                    - Average of {total_count//52:.0f} meetings per week
-                    - Covering {total_count//30:.0f} months of business intelligence
-                    - Searchable across all your key accounts (SPH, Mediacorp, Astra, etc.)
-                    """)
-                
-                # 2. TEMPORAL QUERIES - Recent, latest, last week, this month
-                elif any(word in query_lower for word in ['recent', 'latest', 'last', 'yesterday', 'today', 'this week', 'this month', 'newest']):
-                    st.info("🕒 Searching for recent meetings...")
-                    
-                    # Create embedding for temporal search
-                    embedding = clients['openai'].embeddings.create(
-                        input=search_query + " recent latest new",  # Enhance query for recency
-                        model="text-embedding-ada-002"
-                    ).data[0].embedding
-                    
-                    results = clients['index'].query(
-                        vector=embedding,
-                        top_k=10,  # Get more results to filter by date
-                        include_metadata=True
-                    )
-                    
-                    if results.matches:
-                        st.subheader("📅 Recent Meetings")
-                        # Sort by date if available
-                        sorted_matches = sorted(results.matches, 
-                                              key=lambda x: x.metadata.get('date', ''), 
-                                              reverse=True)[:5]
-                        
-                        for match in sorted_matches:
-                            metadata = match.metadata
-                            date = metadata.get('date', 'Date unknown')
-                            title = metadata.get('title', metadata.get('id', 'Meeting'))
-                            content = metadata.get('text', metadata.get('content', ''))[:200]
-                            
-                            st.write(f"**📍 {date}** - {title}")
-                            if content:
-                                st.write(f"   {content}...")
-                            st.write(f"   *Relevance: {match.score:.1%}*")
-                            st.divider()
-                
-                # 3. PERSON/COMPANY QUERIES - Who, attendees, with
-                elif any(word in query_lower for word in ['who', 'whom', 'attendees', 'participants', 'with']) or \
-                     any(company in query_lower for company in ['sph', 'mediacorp', 'astra', 'google', 'meta', 'teads']):
-                    
-                    st.info("👥 Searching for people and companies...")
-                    
-                    embedding = clients['openai'].embeddings.create(
-                        input=search_query,
-                        model="text-embedding-ada-002"
-                    ).data[0].embedding
-                    
-                    results = clients['index'].query(
-                        vector=embedding,
-                        top_k=10,
-                        include_metadata=True,
-                        filter={"attendees": {"$exists": True}} if "who" in query_lower else None
-                    )
-                    
-                    if results.matches:
-                        st.subheader("👥 Meetings with People/Companies")
-                        
-                        # Group by company if searching for company
-                        for match in results.matches[:5]:
-                            metadata = match.metadata
-                            attendees = metadata.get('attendees', 'Unknown attendees')
-                            date = metadata.get('date', '')
-                            title = metadata.get('title', metadata.get('id', ''))
-                            
-                            st.write(f"**📅 {date}** - {title}")
-                            if attendees and attendees != 'Unknown attendees':
-                                st.write(f"   👥 Attendees: {attendees}")
-                            st.write(f"   📊 Relevance: {match.score:.1%}")
-                            
-                            # Show snippet if available
-                            content = metadata.get('text', metadata.get('content', ''))
-                            if content:
-                                st.write(f"   💬 *{content[:150]}...*")
-                            st.divider()
-                
-                # 4. ACTION/DECISION QUERIES - What, action items, decisions, next steps
-                elif any(word in query_lower for word in ['action', 'decision', 'next step', 'follow up', 'commitment', 'deliverable', 'todo', 'task']):
-                    
-                    st.info("📋 Searching for actions and decisions...")
-                    
-                    # Enhance query to focus on actionable content
-                    enhanced_query = search_query + " action items decisions next steps commitments deliverables"
-                    
-                    embedding = clients['openai'].embeddings.create(
-                        input=enhanced_query,
-                        model="text-embedding-ada-002"
-                    ).data[0].embedding
-                    
-                    results = clients['index'].query(
-                        vector=embedding,
-                        top_k=10,
-                        include_metadata=True
-                    )
-                    
-                    if results.matches:
-                        st.subheader("✅ Actions & Decisions")
-                        
-                        action_count = 0
-                        for match in results.matches:
-                            metadata = match.metadata
-                            content = metadata.get('text', metadata.get('content', ''))
-                            
-                            # Look for action-oriented content
-                            if any(action_word in content.lower() for action_word in ['will', 'must', 'should', 'action', 'next', 'follow']):
-                                action_count += 1
-                                date = metadata.get('date', '')
-                                title = metadata.get('title', metadata.get('id', ''))
-                                
-                                st.write(f"**{action_count}.** 📅 {date} - {title}")
-                                st.write(f"   📌 {content[:250]}...")
-                                st.write(f"   *Relevance: {match.score:.1%}*")
-                                st.divider()
-                                
-                                if action_count >= 5:
-                                    break
-                
-                # 5. TOPIC/THEME QUERIES - About, regarding, related to
-                elif any(word in query_lower for word in ['about', 'regarding', 'related', 'concerning', 'topic', 'discuss']):
-                    
-                    st.info("🎯 Searching for specific topics...")
-                    
-                    embedding = clients['openai'].embeddings.create(
-                        input=search_query,
-                        model="text-embedding-ada-002"
-                    ).data[0].embedding
-                    
-                    results = clients['index'].query(
-                        vector=embedding,
-                        top_k=5,
-                        include_metadata=True
-                    )
-                    
-                    if results.matches:
-                        st.subheader("🎯 Topic-Related Meetings")
-                        
-                        for i, match in enumerate(results.matches, 1):
-                            metadata = match.metadata
-                            date = metadata.get('date', '')
-                            title = metadata.get('title', metadata.get('id', ''))
-                            content = metadata.get('text', metadata.get('content', ''))
-                            
-                            st.write(f"**{i}. {title}** - {date}")
-                            if content:
-                                # Highlight relevant parts
-                                st.write(f"   💡 {content[:300]}...")
-                            st.write(f"   📊 Relevance Score: {match.score:.1%}")
-                            st.divider()
-                
-                # 6. SUMMARY/INSIGHTS QUERIES - Summarize, key points, insights
-                elif any(word in query_lower for word in ['summary', 'summarize', 'key points', 'insights', 'highlights', 'main', 'important']):
-                    
-                    st.info("📝 Generating summary insights...")
-                    
-                    # Get broader set of meetings for summary
-                    embedding = clients['openai'].embeddings.create(
-                        input="important key decisions actions outcomes",
-                        model="text-embedding-ada-002"
-                    ).data[0].embedding
-                    
-                    results = clients['index'].query(
-                        vector=embedding,
-                        top_k=20,
-                        include_metadata=True
-                    )
-                    
-                    if results.matches:
-                        st.subheader("📊 Summary Insights")
-                        
-                        # Analyze patterns
-                        companies = {}
-                        topics = []
-                        recent_dates = []
-                        
-                        for match in results.matches:
-                            metadata = match.metadata
-                            content = str(metadata.get('text', metadata.get('content', '')))
-                            
-                            # Extract companies
-                            for company in ['SPH', 'Mediacorp', 'Astra', 'Google', 'Meta']:
-                                if company.lower() in content.lower():
-                                    companies[company] = companies.get(company, 0) + 1
-                            
-                            # Collect dates
-                            if metadata.get('date'):
-                                recent_dates.append(metadata.get('date'))
-                        
-                        # Display insights
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            st.metric("Total Relevant Meetings", len(results.matches))
-                            st.metric("Avg Relevance Score", f"{sum(m.score for m in results.matches)/len(results.matches):.1%}")
-                        
-                        with col2:
-                            if companies:
-                                top_company = max(companies, key=companies.get)
-                                st.metric("Most Discussed", top_company)
-                                st.metric("Mentions", companies[top_company])
-                        
-                        # Show top insights
-                        st.write("**🎯 Key Themes Found:**")
-                        for i, match in enumerate(results.matches[:3], 1):
-                            content = match.metadata.get('text', match.metadata.get('content', ''))[:150]
-                            if content:
-                                st.write(f"{i}. {content}...")
-                
-                # 7. COMPARISON QUERIES - Compare, versus, vs, difference
-                elif any(word in query_lower for word in ['compare', 'versus', 'vs', 'difference', 'between', 'contrast']):
-                    
-                    st.info("⚖️ Running comparative analysis...")
-                    
-                    embedding = clients['openai'].embeddings.create(
-                        input=search_query,
-                        model="text-embedding-ada-002"
-                    ).data[0].embedding
-                    
-                    results = clients['index'].query(
-                        vector=embedding,
-                        top_k=10,
-                        include_metadata=True
-                    )
-                    
-                    if results.matches:
-                        st.subheader("⚖️ Comparative Analysis")
-                        
-                        # Group results by entity for comparison
-                        entities = {}
-                        for match in results.matches:
-                            metadata = match.metadata
-                            # Group by title or date
-                            key = metadata.get('title', metadata.get('date', 'Unknown'))
-                            if key not in entities:
-                                entities[key] = []
-                            entities[key].append(metadata)
-                        
-                        # Display comparison
-                        for entity, meetings in list(entities.items())[:5]:
-                            st.write(f"**📊 {entity}**")
-                            for meeting in meetings[:2]:
-                                content = meeting.get('text', meeting.get('content', ''))[:150]
-                                if content:
-                                    st.write(f"   • {content}...")
-                            st.divider()
-                
-                # 8. DEFAULT SEMANTIC SEARCH - For everything else
-                else:
-                    # Standard semantic search
-                    embedding = clients['openai'].embeddings.create(
-                        input=search_query,
-                        model="text-embedding-ada-002"
-                    ).data[0].embedding
-                    
-                    results = clients['index'].query(
-                        vector=embedding,
-                        top_k=5,
-                        include_metadata=True
-                    )
-                    
-                    if results.matches:
-                        st.subheader(f"🔍 Search Results for: '{search_query}'")
-                        
-                        for i, match in enumerate(results.matches, 1):
-                            metadata = match.metadata
-                            score = match.score
-                            
-                            # Extract all available fields
-                            date = metadata.get('date', '')
-                            title = metadata.get('title', metadata.get('id', f'Result {i}'))
-                            content = metadata.get('text', metadata.get('content', ''))
-                            attendees = metadata.get('attendees', '')
-                            
-                            # Display result card
-                            with st.container():
-                                col1, col2 = st.columns([3, 1])
-                                with col1:
-                                    st.write(f"**{i}. {title}**")
-                                with col2:
-                                    st.write(f"📊 {score:.1%} match")
-                                
-                                if date:
-                                    st.write(f"📅 {date}")
-                                if attendees:
-                                    st.write(f"👥 {attendees}")
-                                if content:
-                                    st.write(f"💬 {content[:250]}...")
-                                
-                                st.divider()
-                    else:
-                        st.warning(f"No results found for '{search_query}'. Try rephrasing your question or search for specific companies, people, or topics.")
-                        
-                        # Provide suggestions
-                        st.info("""
-                        **💡 Search Tips:**
-                        - For counts: "How many meetings do I have?"
-                        - For people: "Meetings with John from SPH"
-                        - For topics: "Discussions about pricing"
-                        - For recent: "Latest Mediacorp meetings"
-                        - For actions: "Action items from Astra meetings"
-                        """)
-                        
-            except Exception as e:
-                st.error(f"Search error: {str(e)}")
-                st.info("Try refreshing the page or rephrasing your query.")
-        else:
-            st.warning("Please enter a search query")
             
-            # Show example queries
-            st.info("""
-            **🎯 Example Queries You Can Try:**
-            - How many meetings do I have?
-            - Show me recent SPH meetings
-            - What are my action items?
-            - Meetings with Mediacorp about pricing
-            - Summary of key decisions this month
-            - Compare Google vs Meta discussions
-            """)
+
+        if st.button("🔍 Search All Intelligence", type="primary", use_container_width=True):
+            with st.spinner("Analyzing your query..."):
+                if search_query:
+                    try:
+                        query_lower = search_query.lower()
+                        
+                        # 1. STATISTICAL QUERIES - Count, totals, numbers
+                        if any(word in query_lower for word in ['how many', 'count', 'total', 'number of', 'amount', 'quantity']):
+                            stats = clients['index'].describe_index_stats()
+                            total_count = stats.get('total_vector_count', 0)
+                            
+                            st.success(f"📊 **Answer:** You have **{total_count} meetings** indexed in your Business Brain")
+                            
+                            # Provide additional context
+                            st.info(f"""
+                            📈 **Quick Stats:**
+                            - Average of {total_count//52:.0f} meetings per week
+                            - Covering {total_count//30:.0f} months of business intelligence
+                            - Searchable across all your key accounts (SPH, Mediacorp, Astra, etc.)
+                            """)
+                        
+                        # 2. TEMPORAL QUERIES - Recent, latest, last week, this month
+                        elif any(word in query_lower for word in ['recent', 'latest', 'last', 'yesterday', 'today', 'this week', 'this month', 'newest']):
+                            st.info("🕒 Searching for recent meetings...")
+                            
+                            # Create embedding for temporal search
+                            embedding = clients['openai'].embeddings.create(
+                                input=search_query + " recent latest new",  # Enhance query for recency
+                                model="text-embedding-ada-002"
+                            ).data[0].embedding
+                            
+                            results = clients['index'].query(
+                                vector=embedding,
+                                top_k=10,  # Get more results to filter by date
+                                include_metadata=True
+                            )
+                            
+                            if results.matches:
+                                st.subheader("📅 Recent Meetings")
+                                # Sort by date if available
+                                sorted_matches = sorted(results.matches, 
+                                                      key=lambda x: x.metadata.get('date', ''), 
+                                                      reverse=True)[:5]
+                                
+                                for match in sorted_matches:
+                                    metadata = match.metadata
+                                    date = metadata.get('date', 'Date unknown')
+                                    title = metadata.get('title', metadata.get('id', 'Meeting'))
+                                    content = metadata.get('text', metadata.get('content', ''))[:200]
+                                    
+                                    st.write(f"**📍 {date}** - {title}")
+                                    if content:
+                                        st.write(f"   {content}...")
+                                    st.write(f"   *Relevance: {match.score:.1%}*")
+                                    st.divider()
+                        
+                        # 3. PERSON/COMPANY QUERIES - Who, attendees, with
+                        elif any(word in query_lower for word in ['who', 'whom', 'attendees', 'participants', 'with']) or \
+                             any(company in query_lower for company in ['sph', 'mediacorp', 'astra', 'google', 'meta', 'teads']):
+                            
+                            st.info("👥 Searching for people and companies...")
+                            
+                            embedding = clients['openai'].embeddings.create(
+                                input=search_query,
+                                model="text-embedding-ada-002"
+                            ).data[0].embedding
+                            
+                            results = clients['index'].query(
+                                vector=embedding,
+                                top_k=10,
+                                include_metadata=True,
+                                filter={"attendees": {"$exists": True}} if "who" in query_lower else None
+                            )
+                            
+                            if results.matches:
+                                st.subheader("👥 Meetings with People/Companies")
+                                
+                                # Group by company if searching for company
+                                for match in results.matches[:5]:
+                                    metadata = match.metadata
+                                    attendees = metadata.get('attendees', 'Unknown attendees')
+                                    date = metadata.get('date', '')
+                                    title = metadata.get('title', metadata.get('id', ''))
+                                    
+                                    st.write(f"**📅 {date}** - {title}")
+                                    if attendees and attendees != 'Unknown attendees':
+                                        st.write(f"   👥 Attendees: {attendees}")
+                                    st.write(f"   📊 Relevance: {match.score:.1%}")
+                                    
+                                    # Show snippet if available
+                                    content = metadata.get('text', metadata.get('content', ''))
+                                    if content:
+                                        st.write(f"   💬 *{content[:150]}...*")
+                                    st.divider()
+                        
+                        # 4. ACTION/DECISION QUERIES - What, action items, decisions, next steps
+                        elif any(word in query_lower for word in ['action', 'decision', 'next step', 'follow up', 'commitment', 'deliverable', 'todo', 'task']):
+                            
+                            st.info("📋 Searching for actions and decisions...")
+                            
+                            # Enhance query to focus on actionable content
+                            enhanced_query = search_query + " action items decisions next steps commitments deliverables"
+                            
+                            embedding = clients['openai'].embeddings.create(
+                                input=enhanced_query,
+                                model="text-embedding-ada-002"
+                            ).data[0].embedding
+                            
+                            results = clients['index'].query(
+                                vector=embedding,
+                                top_k=10,
+                                include_metadata=True
+                            )
+                            
+                            if results.matches:
+                                st.subheader("✅ Actions & Decisions")
+                                
+                                action_count = 0
+                                for match in results.matches:
+                                    metadata = match.metadata
+                                    content = metadata.get('text', metadata.get('content', ''))
+                                    
+                                    # Look for action-oriented content
+                                    if any(action_word in content.lower() for action_word in ['will', 'must', 'should', 'action', 'next', 'follow']):
+                                        action_count += 1
+                                        date = metadata.get('date', '')
+                                        title = metadata.get('title', metadata.get('id', ''))
+                                        
+                                        st.write(f"**{action_count}.** 📅 {date} - {title}")
+                                        st.write(f"   📌 {content[:250]}...")
+                                        st.write(f"   *Relevance: {match.score:.1%}*")
+                                        st.divider()
+                                        
+                                        if action_count >= 5:
+                                            break
+                        
+                        # 5. TOPIC/THEME QUERIES - About, regarding, related to
+                        elif any(word in query_lower for word in ['about', 'regarding', 'related', 'concerning', 'topic', 'discuss']):
+                            
+                            st.info("🎯 Searching for specific topics...")
+                            
+                            embedding = clients['openai'].embeddings.create(
+                                input=search_query,
+                                model="text-embedding-ada-002"
+                            ).data[0].embedding
+                            
+                            results = clients['index'].query(
+                                vector=embedding,
+                                top_k=5,
+                                include_metadata=True
+                            )
+                            
+                            if results.matches:
+                                st.subheader("🎯 Topic-Related Meetings")
+                                
+                                for i, match in enumerate(results.matches, 1):
+                                    metadata = match.metadata
+                                    date = metadata.get('date', '')
+                                    title = metadata.get('title', metadata.get('id', ''))
+                                    content = metadata.get('text', metadata.get('content', ''))
+                                    
+                                    st.write(f"**{i}. {title}** - {date}")
+                                    if content:
+                                        # Highlight relevant parts
+                                        st.write(f"   💡 {content[:300]}...")
+                                    st.write(f"   📊 Relevance Score: {match.score:.1%}")
+                                    st.divider()
+                        
+                        # 6. SUMMARY/INSIGHTS QUERIES - Summarize, key points, insights
+                        elif any(word in query_lower for word in ['summary', 'summarize', 'key points', 'insights', 'highlights', 'main', 'important']):
+                            
+                            st.info("📝 Generating summary insights...")
+                            
+                            # Get broader set of meetings for summary
+                            embedding = clients['openai'].embeddings.create(
+                                input="important key decisions actions outcomes",
+                                model="text-embedding-ada-002"
+                            ).data[0].embedding
+                            
+                            results = clients['index'].query(
+                                vector=embedding,
+                                top_k=20,
+                                include_metadata=True
+                            )
+                            
+                            if results.matches:
+                                st.subheader("📊 Summary Insights")
+                                
+                                # Analyze patterns
+                                companies = {}
+                                topics = []
+                                recent_dates = []
+                                
+                                for match in results.matches:
+                                    metadata = match.metadata
+                                    content = str(metadata.get('text', metadata.get('content', '')))
+                                    
+                                    # Extract companies
+                                    for company in ['SPH', 'Mediacorp', 'Astra', 'Google', 'Meta']:
+                                        if company.lower() in content.lower():
+                                            companies[company] = companies.get(company, 0) + 1
+                                    
+                                    # Collect dates
+                                    if metadata.get('date'):
+                                        recent_dates.append(metadata.get('date'))
+                                
+                                # Display insights
+                                col1, col2 = st.columns(2)
+                                
+                                with col1:
+                                    st.metric("Total Relevant Meetings", len(results.matches))
+                                    st.metric("Avg Relevance Score", f"{sum(m.score for m in results.matches)/len(results.matches):.1%}")
+                                
+                                with col2:
+                                    if companies:
+                                        top_company = max(companies, key=companies.get)
+                                        st.metric("Most Discussed", top_company)
+                                        st.metric("Mentions", companies[top_company])
+                                
+                                # Show top insights
+                                st.write("**🎯 Key Themes Found:**")
+                                for i, match in enumerate(results.matches[:3], 1):
+                                    content = match.metadata.get('text', match.metadata.get('content', ''))[:150]
+                                    if content:
+                                        st.write(f"{i}. {content}...")
+                        
+                        # 7. COMPARISON QUERIES - Compare, versus, vs, difference
+                        elif any(word in query_lower for word in ['compare', 'versus', 'vs', 'difference', 'between', 'contrast']):
+                            
+                            st.info("⚖️ Running comparative analysis...")
+                            
+                            embedding = clients['openai'].embeddings.create(
+                                input=search_query,
+                                model="text-embedding-ada-002"
+                            ).data[0].embedding
+                            
+                            results = clients['index'].query(
+                                vector=embedding,
+                                top_k=10,
+                                include_metadata=True
+                            )
+                            
+                            if results.matches:
+                                st.subheader("⚖️ Comparative Analysis")
+                                
+                                # Group results by entity for comparison
+                                entities = {}
+                                for match in results.matches:
+                                    metadata = match.metadata
+                                    # Group by title or date
+                                    key = metadata.get('title', metadata.get('date', 'Unknown'))
+                                    if key not in entities:
+                                        entities[key] = []
+                                    entities[key].append(metadata)
+                                
+                                # Display comparison
+                                for entity, meetings in list(entities.items())[:5]:
+                                    st.write(f"**📊 {entity}**")
+                                    for meeting in meetings[:2]:
+                                        content = meeting.get('text', meeting.get('content', ''))[:150]
+                                        if content:
+                                            st.write(f"   • {content}...")
+                                    st.divider()
+                        
+                        # 8. DEFAULT SEMANTIC SEARCH - For everything else
+                        else:
+                            # Standard semantic search
+                            embedding = clients['openai'].embeddings.create(
+                                input=search_query,
+                                model="text-embedding-ada-002"
+                            ).data[0].embedding
+                            
+                            results = clients['index'].query(
+                                vector=embedding,
+                                top_k=5,
+                                include_metadata=True
+                            )
+                            
+                            if results.matches:
+                                st.subheader(f"🔍 Search Results for: '{search_query}'")
+                                
+                                for i, match in enumerate(results.matches, 1):
+                                    metadata = match.metadata
+                                    score = match.score
+                                    
+                                    # Extract all available fields
+                                    date = metadata.get('date', '')
+                                    title = metadata.get('title', metadata.get('id', f'Result {i}'))
+                                    content = metadata.get('text', metadata.get('content', ''))
+                                    attendees = metadata.get('attendees', '')
+                                    
+                                    # Display result card
+                                    with st.container():
+                                        col1, col2 = st.columns([3, 1])
+                                        with col1:
+                                            st.write(f"**{i}. {title}**")
+                                        with col2:
+                                            st.write(f"📊 {score:.1%} match")
+                                        
+                                        if date:
+                                            st.write(f"📅 {date}")
+                                        if attendees:
+                                            st.write(f"👥 {attendees}")
+                                        if content:
+                                            st.write(f"💬 {content[:250]}...")
+                                        
+                                        st.divider()
+                            else:
+                                st.warning(f"No results found for '{search_query}'. Try rephrasing your question or search for specific companies, people, or topics.")
+                                
+                                # Provide suggestions
+                                st.info("""
+                                **💡 Search Tips:**
+                                - For counts: "How many meetings do I have?"
+                                - For people: "Meetings with John from SPH"
+                                - For topics: "Discussions about pricing"
+                                - For recent: "Latest Mediacorp meetings"
+                                - For actions: "Action items from Astra meetings"
+                                """)
+                                
+                    except Exception as e:
+                        st.error(f"Search error: {str(e)}")
+                        st.info("Try refreshing the page or rephrasing your query.")
+                else:
+                    st.warning("Please enter a search query")
+                    
+                    # Show example queries
+                    st.info("""
+                    **🎯 Example Queries You Can Try:**
+                    - How many meetings do I have?
+                    - Show me recent SPH meetings
+                    - What are my action items?
+                    - Meetings with Mediacorp about pricing
+                    - Summary of key decisions this month
+                    - Compare Google vs Meta discussions
+                    """)
 
 # TAB 3: ACTION TRACKER
 with main_tab3:
