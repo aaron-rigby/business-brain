@@ -237,7 +237,7 @@ with main_tab2:
             default=["Meetings"]
         )
     
- if st.button("🔍 Search All Intelligence", type="primary", use_container_width=True):
+if st.button("🔍 Search All Intelligence", type="primary", use_container_width=True):
     with st.spinner("Searching across all data sources..."):
         if query:
             try:
@@ -275,7 +275,7 @@ with main_tab2:
             except Exception as e:
                 st.error(f"Search error: {str(e)}")
         else:
-            st.warning("Please enter a search query")
+            st.warning("Please enter a search query") 
 
 # TAB 3: ACTION TRACKER
 with main_tab3:
