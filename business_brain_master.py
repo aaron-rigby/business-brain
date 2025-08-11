@@ -239,11 +239,11 @@ with main_tab2:
     
 if st.button("🔍 Search All Intelligence", type="primary", use_container_width=True):
     with st.spinner("Searching across all data sources..."):
-        if query:
+        if search_query:
             try:
                 # Create embedding for the query
                 embedding = clients['openai'].embeddings.create(
-                    input=query,
+                    input=search_query,
                     model="text-embedding-ada-002"
                 ).data[0].embedding
                 
