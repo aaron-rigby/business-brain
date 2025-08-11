@@ -237,23 +237,45 @@ with main_tab2:
             default=["Meetings"]
         )
     
-    if st.button("🔍 Search All Intelligence", type="primary", use_container_width=True):
-        with st.spinner("Searching across all data sources..."):
-            # Search logic here
-            # This would integrate all your search functions
-            results = {
-                'meetings': ["SPH meeting on July 15: Discussed pricing concerns"],
-                'crm': ["John Smith - Last contact: 5 days ago"],
-                'qlik': ["SPH CTR: 2.3% (down 10% WoW)"],
-                'guru': ["SPH battlecard: Focus on viewability improvements"]
-            }
-            
-            # Display results
-            for source, items in results.items():
-                if items:
-                    st.markdown(f"### 📌 From {source.upper()}")
-                    for item in items:
-                        st.write(f"• {item}")
+ if st.button("🔍 Search All Intelligence", type="primary", use_container_width=True):
+    with st.spinner("Searching across all data sources..."):
+        if query:
+            try:
+                # Create embedding for the query
+                embedding = clients['openai'].embeddings.create(
+                    input=query,
+                    model="text-embedding-ada-002"
+                ).data[0].embedding
+                
+                # Query Pinecone for similar content
+                results = clients['index'].query(
+                    vector=embedding,
+                    top_k=5,
+                    include_metadata=True
+                )
+                
+                # Display results
+                if results.matches:
+                    st.subheader("📍 From MEETINGS")
+                    for match in results.matches:
+                        metadata = match.metadata
+                        score = match.score
+                        
+                        # Display meeting info
+                        meeting_date = metadata.get('date', 'Unknown date')
+                        meeting_title = metadata.get('title', 'Meeting')
+                        meeting_text = metadata.get('text', '')[:300] + "..."
+                        
+                        st.write(f"• **{meeting_title}** ({meeting_date}) - Score: {score:.2f}")
+                        st.write(f"  {meeting_text}")
+                        st.divider()
+                else:
+                    st.info("No matching results found. Try a different search query.")
+                    
+            except Exception as e:
+                st.error(f"Search error: {str(e)}")
+        else:
+            st.warning("Please enter a search query")
 
 # TAB 3: ACTION TRACKER
 with main_tab3:
