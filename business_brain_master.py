@@ -41,7 +41,7 @@ OPENAI_API_KEY = get_api_key("OPENAI_API_KEY")
 PINECONE_API_KEY = get_api_key("PINECONE_API_KEY")
 NOTION_TOKEN = get_api_key("NOTION_TOKEN")
 PINECONE_INDEX_NAME = "business-brain"
-PIPELINE_DB_ID = "14d6e7c2-3838-804c-844a-000c85c988c6"
+PIPELINE_DB_ID = get_api_key("PIPELINE_DB_ID")
 
 # Verify keys are loaded
 if not OPENAI_API_KEY:
