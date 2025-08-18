@@ -1,268 +1,451 @@
+#!/usr/bin/env python3
+"""
+BUSINESS BRAIN MASTER SYSTEM
+Complete unified dashboard with all features integrated
+Version 5.0 - With Salesforce Pipeline Integration
+"""
+
 import streamlit as st
 import pandas as pd
+import json
+import openai
+from pinecone import Pinecone
+from notion_client import Client
+from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import json
+from typing import Dict, List, Optional
 import os
-from openai import OpenAI
-from pinecone import Pinecone
-import time
-
-# Password Protection
-def check_password():
-    """Returns `True` if the user had the correct password."""
-    
-    def password_entered():
-        """Checks whether a password entered by the user is correct."""
-        if st.session_state["password"] == st.secrets.get("APP_PASSWORD", "YourDefaultPassword"):
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Don't store password
-        else:
-            st.session_state["password_correct"] = False
-
-    if "password_correct" not in st.session_state:
-        # First run, show input for password
-        st.text_input(
-            "Password", type="password", on_change=password_entered, key="password"
-        )
-        return False
-    elif not st.session_state["password_correct"]:
-        # Password not correct, show input + error
-        st.text_input(
-            "Password", type="password", on_change=password_entered, key="password"
-        )
-        st.error("😕 Password incorrect")
-        return False
-    else:
-        # Password correct
-        return True
-
-if not check_password():
-    st.stop()  # Do not continue if check_password is not True
+import pytz
 
 # Page Configuration
 st.set_page_config(
-    page_title="Business Brain Master",
+    page_title="🧠 Business Brain Master",
     page_icon="🧠",
     layout="wide",
-    initial_sidebar_state="expanded"  # Changed to show sidebar
+    initial_sidebar_state="expanded"
 )
 
-# Custom CSS
-st.markdown("""
-<style>
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 24px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 50px;
-        padding-left: 20px;
-        padding-right: 20px;
-    }
-    div[data-testid="metric-container"] {
-        background-color: #f0f2f6;
-        border: 1px solid #e0e0e0;
-        padding: 10px;
-        border-radius: 10px;
-        margin: 10px 0;
-    }
-    .main-header {
-        font-size: 3rem;
-        font-weight: bold;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .cost-tracker {
-        background-color: #fff3cd;
-        border: 1px solid #ffc107;
-        padding: 10px;
-        border-radius: 5px;
-        margin: 10px 0;
-    }
-</style>
-""", unsafe_allow_html=True)
+# Load Configuration
+from dotenv import load_dotenv
+load_dotenv()
 
-# Initialize session state for cost tracking
-if 'total_cost' not in st.session_state:
-    st.session_state.total_cost = 0.0
-if 'search_count' not in st.session_state:
-    st.session_state.search_count = 0
-if 'monthly_cost' not in st.session_state:
-    st.session_state.monthly_cost = 0.0
+# Get API keys from Streamlit secrets (cloud) or environment variables (local)
+def get_api_key(key_name):
+    if hasattr(st, 'secrets') and key_name in st.secrets:
+        return st.secrets[key_name]
+    return os.getenv(key_name)
 
-# Cost calculation functions
-def calculate_search_cost(model, query_length, response_length=1000):
-    """Calculate the cost of a search based on the model used"""
-    # Approximate token counts
-    query_tokens = query_length * 0.25  # Rough estimate: 1 token per 4 chars
-    response_tokens = response_length * 0.25
-    
-    # Pricing per 1K tokens (as of Dec 2024)
-    pricing = {
-        "GPT-3.5": {"input": 0.0005, "output": 0.0015},  # $0.50/$1.50 per 1M tokens
-        "GPT-4": {"input": 0.01, "output": 0.03},  # $10/$30 per 1M tokens
-        "GPT-4-Turbo": {"input": 0.01, "output": 0.03},
-        "Claude": {"input": 0.008, "output": 0.024}  # Approximate Claude pricing
-    }
-    
-    model_key = "GPT-3.5" if "3.5" in model else "GPT-4" if "GPT-4" in model else "Claude"
-    
-    input_cost = (query_tokens / 1000) * pricing[model_key]["input"]
-    output_cost = (response_tokens / 1000) * pricing[model_key]["output"]
-    
-    # Add embedding cost (text-embedding-ada-002)
-    embedding_cost = (query_tokens / 1000) * 0.0001  # $0.10 per 1M tokens
-    
-    total_cost = input_cost + output_cost + embedding_cost
-    
-    return round(total_cost, 4)
+# Set API keys
+OPENAI_API_KEY = get_api_key("OPENAI_API_KEY")
+PINECONE_API_KEY = get_api_key("PINECONE_API_KEY")
+NOTION_TOKEN = get_api_key("NOTION_TOKEN")
+PINECONE_INDEX_NAME = "business-brain"
+PIPELINE_DB_ID = "14d6e7c2-3838-804c-844a-000c85c988c6"
+
+# Verify keys are loaded
+if not OPENAI_API_KEY:
+    st.error("OpenAI API key not found. Please check your configuration.")
+    st.stop()
+if not PINECONE_API_KEY:
+    st.error("Pinecone API key not found. Please check your configuration.")
+    st.stop()
+if not NOTION_TOKEN:
+    st.error("Notion token not found. Please check your configuration.")
+    st.stop()
 
 # Initialize Clients
 @st.cache_resource
 def init_all_clients():
     """Initialize all API clients"""
     clients = {
-        'openai': OpenAI(api_key=os.getenv("OPENAI_API_KEY")),
-        'pinecone': Pinecone(api_key=os.getenv("PINECONE_API_KEY")),
-        'index': Pinecone(api_key=os.getenv("PINECONE_API_KEY")).Index(os.getenv("PINECONE_INDEX_NAME", "business-brain"))
+        'openai': openai.OpenAI(api_key=OPENAI_API_KEY),
+        'pinecone': Pinecone(api_key=PINECONE_API_KEY),
+        'index': Pinecone(api_key=PINECONE_API_KEY).Index(PINECONE_INDEX_NAME),
+        'notion': Client(auth=NOTION_TOKEN)
     }
     return clients
 
-# Load clients
 clients = init_all_clients()
 
-# Sidebar with Cost Tracking and Stats
-with st.sidebar:
-    st.title("🧠 Business Brain")
-    st.markdown("---")
-    
-    # Cost Tracking Section
-    st.markdown("### 💰 Cost Tracker")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Session Cost", f"${st.session_state.total_cost:.4f}")
-        st.metric("Searches", st.session_state.search_count)
-    with col2:
-        st.metric("Monthly Est.", f"${st.session_state.monthly_cost:.2f}")
-        avg_cost = st.session_state.total_cost / max(st.session_state.search_count, 1)
-        st.metric("Avg/Search", f"${avg_cost:.4f}")
-    
-    # Model pricing info
-    with st.expander("💡 Model Pricing"):
-        st.markdown("""
-        **Per search (approximate):**
-        - 🟢 GPT-3.5: $0.002 - $0.005
-        - 🟡 GPT-4: $0.02 - $0.05
-        - 🔵 Claude: $0.015 - $0.04
-        
-        **Monthly estimates based on:**
-        - 50 searches/day = 1,500/month
-        """)
-    
-    st.markdown("---")
-    
-    # Quick Stats
-    st.markdown("### 📊 System Stats")
-    try:
-        index_stats = clients['index'].describe_index_stats()
-        total_meetings = index_stats.get('total_vector_count', 0)
-    except:
-        total_meetings = 354
-    
-    st.metric("Total Meetings", total_meetings)
-    st.metric("Knowledge Base", "4,000+ cards")
-    st.metric("Response Time", "~2-3 sec")
-    
-    st.markdown("---")
-    
-    # Quick Links
-    st.markdown("### 🔗 Quick Links")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.button("📧 Gmail", use_container_width=True)
-        st.button("📊 Qlik", use_container_width=True)
-    with col2:
-        st.button("📅 Calendar", use_container_width=True)
-        st.button("💼 LinkedIn", use_container_width=True)
+# Initialize Session State
+if 'daily_brief' not in st.session_state:
+    st.session_state.daily_brief = None
+if 'action_items' not in st.session_state:
+    st.session_state.action_items = []
+if 'crm_contacts' not in st.session_state:
+    st.session_state.crm_contacts = {}
+if 'new_big_deals' not in st.session_state:
+    st.session_state.new_big_deals = []
+
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        text-align: center;
+        font-weight: bold;
+        padding: 1rem 0;
+    }
+    .status-card {
+        background: white;
+        border-radius: 10px;
+        padding: 1rem;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        margin: 0.5rem 0;
+    }
+    .metric-highlight {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        text-align: center;
+    }
+    .deal-alert {
+        background: #fee2e2;
+        border-left: 4px solid #ef4444;
+        padding: 1rem;
+        margin: 0.5rem 0;
+        border-radius: 0.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # Header
-st.markdown('<h1 class="main-header">🧠 Business Brain Master System</h1>', unsafe_allow_html=True)
+st.markdown("<h1 class='main-header'>🧠 Business Brain Master System</h1>", unsafe_allow_html=True)
 
-# Top Metrics Row
+# Fetch Pipeline Data
+@st.cache_data(ttl=300)
+def fetch_pipeline_data():
+    """Fetch Salesforce pipeline from Notion"""
+    try:
+        response = clients['notion'].databases.query(database_id=PIPELINE_DB_ID)
+        deals = []
+        for page in response['results']:
+            props = page['properties']
+            
+            # Extract last modified/captured date
+            date_captured = props.get('Date_Captured', {}).get('date', {}).get('start', None)
+            if date_captured:
+                date_captured = datetime.fromisoformat(date_captured.replace('Z', '+00:00'))
+            
+            deal = {
+                'Name': props.get('Opportunity Name', {}).get('title', [{}])[0].get('text', {}).get('content', 'Unknown'),
+                'Amount': props.get('Amount_USD', {}).get('number', 0),
+                'Stage': props.get('Stage', {}).get('select', {}).get('name', 'Unknown'),
+                'Owner': props.get('Owner', {}).get('rich_text', [{}])[0].get('text', {}).get('content', 'Unknown'),
+                'Owner_Nickname': props.get('Owner_Nickname', {}).get('select', {}).get('name', 'Unknown'),
+                'Market': props.get('Market', {}).get('select', {}).get('name', 'Unknown'),
+                'Close_Date': props.get('Close_Date', {}).get('date', {}).get('start', None),
+                'Date_Captured': date_captured,
+                'Account_Name': props.get('Account_Name', {}).get('rich_text', [{}])[0].get('text', {}).get('content', 'Unknown')
+            }
+            deals.append(deal)
+        return pd.DataFrame(deals)
+    except Exception as e:
+        st.error(f"Error fetching pipeline: {e}")
+        return pd.DataFrame()
+
+# Load pipeline data
+df_pipeline = fetch_pipeline_data()
+
+# Check for new big deals (for morning alert)
+if not df_pipeline.empty:
+    bangkok_tz = pytz.timezone('Asia/Bangkok')
+    today = datetime.now(bangkok_tz).date()
+    
+    # Find deals added today that are over $20k
+    new_big_deals = []
+    for _, deal in df_pipeline.iterrows():
+        if deal['Date_Captured'] and deal['Amount'] >= 20000:
+            deal_date = deal['Date_Captured'].date() if hasattr(deal['Date_Captured'], 'date') else deal['Date_Captured']
+            if deal_date == today:
+                new_big_deals.append(deal)
+    
+    if new_big_deals:
+        st.session_state.new_big_deals = new_big_deals
+
+# Top Metrics Bar (Updated with Pipeline data)
 col1, col2, col3, col4, col5 = st.columns(5)
-
 with col1:
-    st.metric("📊 Meetings Indexed", total_meetings, "+12 this week", delta_color="normal")
-
+    total_pipeline = df_pipeline['Amount'].sum() if not df_pipeline.empty else 0
+    st.metric("💰 Pipeline", f"${total_pipeline/1000000:.1f}M")
 with col2:
-    st.metric("✅ Open Actions", "23", "-3 completed", delta_color="inverse")
-
+    active_deals = len(df_pipeline[df_pipeline['Stage'] != 'Closed Lost']) if not df_pipeline.empty else 0
+    st.metric("🎯 Active Deals", active_deals)
 with col3:
-    st.metric("👥 CRM Contacts", "0", "", delta_color="off")
-
+    st.metric("💥 CRM Contacts", len(st.session_state.crm_contacts))
 with col4:
-    st.metric("📈 Qlik Alerts", "3", "2 critical", delta_color="normal")
-
+    st.metric("📈 Qlik Alerts", "3", delta="2 critical")
 with col5:
-    st.metric("🎯 VP Progress", "62%", "+5%", delta_color="normal")
+    st.metric("🎯 VP Progress", "62%", delta="+5%")
 
-# Main Tabs
-main_tab1, main_tab2, main_tab3, main_tab4, main_tab5, main_tab6 = st.tabs([
+# Morning Alert for Big Deals
+if st.session_state.new_big_deals:
+    st.markdown("### 🚨 New Big Deals Alert (>$20K)")
+    for deal in st.session_state.new_big_deals:
+        st.warning(f"🆕 **{deal['Name']}** - ${deal['Amount']:,.0f} - {deal['Owner_Nickname']} ({deal['Market']})")
+
+st.divider()
+
+# Main Navigation Tabs
+main_tab1, main_tab2, main_tab3, main_tab4, main_tab5, main_tab6, main_tab7 = st.tabs([
     "🏠 Command Center",
+    "💰 Salesforce Pipeline",
     "🔍 Intelligence Search", 
     "📋 Action Tracker",
-    "👥 CRM & Outreach",
+    "💥 CRM & Outreach",
     "📊 Performance (Qlik)",
-    "🤖 Automation"
+    "⚙️ Automation"
 ])
 
 # TAB 1: COMMAND CENTER
 with main_tab1:
     st.markdown("## 🎯 Daily Intelligence Brief")
     
-    col1, col2 = st.columns([2, 1])
+    # Generate Daily Brief Button
+    if st.button("🌅 Generate Today's Brief", type="primary"):
+        with st.spinner("Generating intelligence brief..."):
+            # This would call all your intelligence gathering functions
+            st.session_state.daily_brief = {
+                'date': datetime.now().strftime('%Y-%m-%d'),
+                'priorities': ["Follow up with SPH on pricing", "Mediacorp Q4 planning call", "Review Astra expansion"],
+                'alerts': ["Qlik: CTR down 15% for SPH", "LinkedIn: John Smith promoted to VP"],
+                'opportunities': ["Astra interested in premium inventory", "New Google ad format opportunity"],
+                'big_deals': st.session_state.new_big_deals
+            }
+    
+    if st.session_state.daily_brief:
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown("### ⚡ Today's Priorities")
+            for priority in st.session_state.daily_brief['priorities']:
+                st.checkbox(priority, key=f"priority_{priority}")
+        
+        with col2:
+            st.markdown("### 🚨 Alerts")
+            for alert in st.session_state.daily_brief['alerts']:
+                st.warning(alert)
+        
+        with col3:
+            st.markdown("### 💰 Opportunities")
+            for opp in st.session_state.daily_brief['opportunities']:
+                st.success(opp)
+    
+    # Quick Actions Grid
+    st.markdown("### 🚀 Quick Actions")
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        if st.button("📋 Generate Today's Brief", type="primary", use_container_width=True):
-            with st.spinner("Generating your intelligence brief..."):
-                # This would cost money, so we'll simulate
-                brief_cost = calculate_search_cost("GPT-4", 500, 2000)
-                st.session_state.total_cost += brief_cost
-                st.session_state.search_count += 1
-                
-                st.success(f"Daily brief generated! (Cost: ${brief_cost:.4f})")
-                st.markdown("""
-                ### 📅 Monday, December 15, 2024
-                
-                **🔥 Priority Actions:**
-                1. Follow up with SPH on pricing proposal
-                2. Prepare Mediacorp Q1 campaign review
-                3. Submit Astra International renewal docs
-                
-                **📊 Key Metrics:**
-                - Pipeline: $2.3M (87% to target)
-                - At-risk renewals: 2 accounts ($450K)
-                - New opportunities: 5 qualified leads
-                
-                **🎯 Strategic Focus:**
-                - SEA expansion: Indonesia office planning
-                - Team scaling: 3 open headcount approved
-                - Product launch: Native video units (Jan 2025)
-                """)
-    
-    with col2:
-        st.markdown("### ⚡ Quick Actions")
         if st.button("📧 Check Outreach Queue", use_container_width=True):
-            st.info("3 follow-ups pending")
+            st.session_state.active_tab = "crm"
+    with col2:
         if st.button("📊 View Qlik Dashboard", use_container_width=True):
-            st.info("Opening Qlik...")
+            st.session_state.active_tab = "qlik"
+    with col3:
         if st.button("📅 Prep Tomorrow's Meetings", use_container_width=True):
-            st.info("2 meetings tomorrow")
+            st.session_state.active_tab = "calendar"
+    with col4:
+        if st.button("🔍 Search Intelligence", use_container_width=True):
+            st.session_state.active_tab = "search"
 
-# TAB 2: INTELLIGENCE SEARCH
+# TAB 2: SALESFORCE PIPELINE (NEW ENHANCED)
 with main_tab2:
+    st.markdown("## 💰 Salesforce Pipeline Analytics")
+    
+    if not df_pipeline.empty:
+        # Pipeline Summary Metrics
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
+        with col1:
+            total = df_pipeline['Amount'].sum()
+            st.metric("Total Pipeline", f"${total:,.0f}")
+        with col2:
+            qualified = df_pipeline[df_pipeline['Stage'].str.contains('Qualified', na=False)]['Amount'].sum()
+            st.metric("Qualified", f"${qualified:,.0f}")
+        with col3:
+            proposal = df_pipeline[df_pipeline['Stage'].str.contains('Proposal', na=False)]['Amount'].sum()
+            st.metric("In Proposal", f"${proposal:,.0f}")
+        with col4:
+            avg_deal = df_pipeline['Amount'].mean()
+            st.metric("Avg Deal", f"${avg_deal:,.0f}")
+        with col5:
+            total_sellers = df_pipeline['Owner_Nickname'].nunique()
+            st.metric("Active Sellers", total_sellers)
+        with col6:
+            markets = df_pipeline['Market'].nunique()
+            st.metric("Markets", markets)
+        
+        st.divider()
+        
+        # Sub-tabs for different views
+        pipe_tab1, pipe_tab2, pipe_tab3, pipe_tab4, pipe_tab5 = st.tabs([
+            "📊 By Market", "👥 By Seller", "🎯 Top 10 Deals", "⏰ Stale Deals", "🔍 Pipeline Intelligence"
+        ])
+        
+        with pipe_tab1:
+            st.markdown("### 📊 Pipeline by Market")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                # Market summary
+                market_summary = df_pipeline.groupby('Market').agg({
+                    'Amount': 'sum',
+                    'Name': 'count'
+                }).rename(columns={'Name': 'Deal_Count'}).sort_values('Amount', ascending=False)
+                
+                # Bar chart
+                fig = px.bar(market_summary, y=market_summary.index, x='Amount', 
+                            orientation='h', title='Pipeline Value by Market',
+                            labels={'Amount': 'Pipeline Value ($)', 'index': 'Market'})
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # Pie chart
+                fig = px.pie(market_summary, values='Amount', names=market_summary.index,
+                           title='Market Distribution')
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Market details table
+            st.markdown("### Market Details")
+            market_details = df_pipeline.groupby('Market').agg({
+                'Amount': ['sum', 'mean', 'count'],
+                'Stage': lambda x: x.value_counts().index[0] if len(x) > 0 else 'N/A'
+            }).round(0)
+            market_details.columns = ['Total Pipeline', 'Avg Deal Size', 'Deal Count', 'Most Common Stage']
+            st.dataframe(market_details.sort_values('Total Pipeline', ascending=False), use_container_width=True)
+        
+        with pipe_tab2:
+            st.markdown("### 👥 Pipeline by Seller")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                # Seller summary
+                seller_summary = df_pipeline.groupby('Owner_Nickname').agg({
+                    'Amount': 'sum',
+                    'Name': 'count',
+                    'Market': 'first'
+                }).rename(columns={'Name': 'Deal_Count'}).sort_values('Amount', ascending=False)
+                
+                # Top 10 sellers bar chart
+                top_sellers = seller_summary.head(10)
+                fig = px.bar(top_sellers, y=top_sellers.index, x='Amount',
+                           orientation='h', title='Top 10 Sellers by Pipeline',
+                           color='Market')
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # Seller performance metrics
+                st.markdown("#### 🏆 Top Performers")
+                for i, (seller, data) in enumerate(seller_summary.head(5).iterrows(), 1):
+                    st.metric(f"{i}. {seller} ({data['Market']})", 
+                             f"${data['Amount']:,.0f}",
+                             f"{int(data['Deal_Count'])} deals")
+            
+            # Seller details table
+            st.markdown("### Seller Performance Details")
+            seller_details = df_pipeline.groupby(['Owner_Nickname', 'Market']).agg({
+                'Amount': ['sum', 'mean', 'count'],
+                'Stage': lambda x: x.value_counts().index[0] if len(x) > 0 else 'N/A'
+            }).round(0)
+            seller_details.columns = ['Total Pipeline', 'Avg Deal Size', 'Deal Count', 'Most Common Stage']
+            st.dataframe(seller_details.sort_values('Total Pipeline', ascending=False), use_container_width=True)
+        
+        with pipe_tab3:
+            st.markdown("### 🎯 Top 10 Biggest Deals")
+            
+            # Calculate days since last update
+            df_pipeline['Days_Since_Update'] = (datetime.now() - pd.to_datetime(df_pipeline['Date_Captured'])).dt.days
+            
+            # Get top 10 deals
+            top_deals = df_pipeline.nlargest(10, 'Amount')[
+                ['Name', 'Account_Name', 'Amount', 'Stage', 'Owner_Nickname', 'Market', 'Days_Since_Update', 'Close_Date']
+            ]
+            
+            # Display as cards
+            for _, deal in top_deals.iterrows():
+                days_color = "🟢" if deal['Days_Since_Update'] < 7 else "🟡" if deal['Days_Since_Update'] < 14 else "🔴"
+                
+                col1, col2, col3, col4, col5 = st.columns([3, 2, 1, 1, 1])
+                with col1:
+                    st.markdown(f"**{deal['Name']}**")
+                    st.caption(f"{deal['Account_Name']}")
+                with col2:
+                    st.metric("Value", f"${deal['Amount']:,.0f}")
+                with col3:
+                    st.metric("Stage", deal['Stage'])
+                with col4:
+                    st.metric("Owner", deal['Owner_Nickname'])
+                with col5:
+                    st.metric("Last Update", f"{days_color} {deal['Days_Since_Update']}d ago")
+                
+                st.divider()
+        
+        with pipe_tab4:
+            st.markdown("### ⏰ Deals Needing Attention")
+            
+            # Stale deals (not updated in 14+ days)
+            stale_deals = df_pipeline[df_pipeline['Days_Since_Update'] >= 14].sort_values('Amount', ascending=False)
+            
+            if not stale_deals.empty:
+                st.error(f"⚠️ {len(stale_deals)} deals haven't been updated in 2+ weeks!")
+                
+                # Group by owner
+                stale_by_owner = stale_deals.groupby('Owner_Nickname').agg({
+                    'Amount': 'sum',
+                    'Name': 'count'
+                }).rename(columns={'Name': 'Stale_Deal_Count'})
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("#### Stale Deals by Owner")
+                    st.dataframe(stale_by_owner.sort_values('Amount', ascending=False))
+                
+                with col2:
+                    st.markdown("#### Top Stale Deals to Review")
+                    for _, deal in stale_deals.head(5).iterrows():
+                        st.warning(f"**{deal['Name']}** - ${deal['Amount']:,.0f} - {deal['Days_Since_Update']} days old - {deal['Owner_Nickname']}")
+            else:
+                st.success("✅ All deals have been updated recently!")
+        
+        with pipe_tab5:
+            st.markdown("### 🔍 AI Pipeline Intelligence")
+            
+            pipeline_query = st.text_area(
+                "Ask about your pipeline:",
+                placeholder="Which deals need attention? What's our exposure in India? Who are the top performers?",
+                height=80
+            )
+            
+            if st.button("🧠 Analyze Pipeline", type="primary"):
+                with st.spinner("Analyzing pipeline with AI..."):
+                    # Create context from pipeline data
+                    pipeline_context = f"""
+                    Total Pipeline: ${df_pipeline['Amount'].sum():,.0f}
+                    Total Deals: {len(df_pipeline)}
+                    By Market: {df_pipeline.groupby('Market')['Amount'].sum().to_dict()}
+                    By Stage: {df_pipeline.groupby('Stage')['Amount'].sum().to_dict()}
+                    Top Sellers: {df_pipeline.groupby('Owner_Nickname')['Amount'].sum().nlargest(5).to_dict()}
+                    Stale Deals: {len(df_pipeline[df_pipeline['Days_Since_Update'] >= 14])} deals not updated in 14+ days
+                    """
+                    
+                    response = clients['openai'].chat.completions.create(
+                        model="gpt-4",
+                        messages=[
+                            {"role": "system", "content": "You are a sales analytics expert analyzing the pipeline."},
+                            {"role": "user", "content": f"{pipeline_query}\n\nPipeline Context:\n{pipeline_context}"}
+                        ]
+                    )
+                    
+                    st.write(response.choices[0].message.content)
+    else:
+        st.warning("No pipeline data available. Check your Notion connection.")
+
+# TAB 3: INTELLIGENCE SEARCH
+with main_tab3:
     st.markdown("## 🔍 Unified Intelligence Search")
     
     # Search Configuration
@@ -271,533 +454,275 @@ with main_tab2:
     with col1:
         search_query = st.text_area(
             "Ask anything about your business:",
-            placeholder="E.g., What are the main themes across client meetings? What's our competitive situation?",
+            placeholder="E.g., What are all my commitments to SPH? What's the competitive situation with Google?",
             height=80
         )
     
     with col2:
         ai_model = st.selectbox(
             "AI Model",
-            ["GPT-4 (Smart)", "GPT-3.5 (Fast)", "Claude (Balanced)"],
-            help="GPT-4: Best reasoning ($0.02-0.05/search)\nGPT-3.5: Fastest ($0.002-0.005/search)\nClaude: Balanced ($0.015-0.04/search)"
+            ["GPT-4 (Smart)", "GPT-3.5 (Fast)"]
         )
-    
+        
     with col3:
         data_sources = st.multiselect(
             "Search in",
-            ["Meetings", "CRM", "Qlik", "Guru"],
-            default=["Meetings"]
+            ["Meetings", "Pipeline", "CRM", "Qlik", "Guru"],
+            default=["Meetings", "Pipeline"]
         )
-        
-        # Show estimated cost
-        if search_query:
-            est_cost = calculate_search_cost(ai_model, len(search_query))
-            st.info(f"Est. cost: ${est_cost:.4f}")
     
-    # Advanced AI Search Button
     if st.button("🔍 Search All Intelligence", type="primary", use_container_width=True):
-        with st.spinner("Analyzing your query with advanced AI reasoning..."):
-            if search_query:
+        with st.spinner("Searching across all data sources..."):
+            # Enhanced search with pipeline data
+            results = {}
+            
+            if "Meetings" in data_sources:
+                # Pinecone RAG search
                 try:
-                    query_lower = search_query.lower()
+                    search_embedding = clients['openai'].embeddings.create(
+                        model="text-embedding-ada-002",
+                        input=search_query
+                    ).data[0].embedding
                     
-                    # Calculate and track cost
-                    search_cost = calculate_search_cost(ai_model, len(search_query), 2000)
-                    st.session_state.total_cost += search_cost
-                    st.session_state.search_count += 1
-                    st.session_state.monthly_cost = (st.session_state.total_cost / max(st.session_state.search_count, 1)) * 1500
-                    
-                    # 1. STATISTICAL QUERIES - Optimized
-                    if any(word in query_lower for word in ['how many', 'count', 'total', 'number of', 'amount', 'quantity']):
-                        stats = clients['index'].describe_index_stats()
-                        total_count = stats.get('total_vector_count', 0)
-                        
-                        st.success(f"📊 **Answer:** You have **{total_count} meetings** indexed in your Business Brain")
-                        
-                        # Add intelligent insights
-                        st.info(f"""
-                        📈 **Intelligent Analysis:**
-                        - Average of {total_count//52:.0f} meetings per week
-                        - Covering {total_count//30:.0f} months of business intelligence
-                        - Top accounts: SPH, Mediacorp, Astra International
-                        - Estimated {total_count * 45:.0f} minutes of meeting content
-                        - Searchable across {len(data_sources)} data sources
-                        
-                        💰 **Search Cost:** ${search_cost:.4f} | **Total Session:** ${st.session_state.total_cost:.4f}
-                        """)
-                    
-                    # 2. THEMATIC/ANALYTICAL QUERIES - Advanced AI Reasoning
-                    elif any(word in query_lower for word in ['theme', 'themes', 'pattern', 'patterns', 'summary', 'summarize', 'analyze', 'analysis', 'insights', 'trend', 'trends', 'main', 'key']):
-                        
-                        st.info("🧠 Performing advanced thematic analysis across your meetings...")
-                        
-                        # Get relevant meetings
-                        embedding = clients['openai'].embeddings.create(
-                            input=search_query,
-                            model="text-embedding-ada-002"
-                        ).data[0].embedding
-                        
-                        results = clients['index'].query(
-                            vector=embedding,
-                            top_k=20,  # Get more for better analysis
-                            include_metadata=True
-                        )
-                        
-                        if results.matches:
-                            # Collect meeting content for analysis
-                            meeting_contents = []
-                            meeting_dates = []
-                            meeting_ids = []
-                            
-                            for match in results.matches[:15]:  # Use top 15 most relevant
-                                metadata = match.metadata
-                                content = metadata.get('text', metadata.get('content', ''))
-                                if content:
-                                    meeting_contents.append(f"[Meeting {metadata.get('id', 'Unknown')}]: {content[:500]}")
-                                    meeting_dates.append(metadata.get('date', 'Unknown'))
-                                    meeting_ids.append(metadata.get('id', 'Unknown'))
-                            
-                            if meeting_contents:
-                                # Advanced AI Analysis
-                                analysis_prompt = f"""
-                                You are an expert business intelligence analyst for a Regional Director at Taboola managing SEA/India regions.
-                                
-                                Analyze these {len(meeting_contents)} meeting excerpts to answer: {search_query}
-                                
-                                Meeting Content:
-                                {chr(10).join(meeting_contents[:10])}
-                                
-                                Provide a comprehensive analysis with:
-                                
-                                1. **KEY THEMES** (3-5 main themes with specific examples)
-                                2. **PATTERNS & TRENDS** (What's changing over time?)
-                                3. **CRITICAL INSIGHTS** (What's most important for business success?)
-                                4. **ACTION ITEMS** (What needs immediate attention?)
-                                5. **STRATEGIC RECOMMENDATIONS** (Based on the patterns you see)
-                                6. **RISK FACTORS** (Any concerns or red flags?)
-                                
-                                Be specific, reference actual content, and provide actionable intelligence.
-                                Focus on what will help achieve VP promotion by 2028.
-                                """
-                                
-                                # Get AI analysis based on selected model
-                                model_name = "gpt-3.5-turbo" if "3.5" in ai_model else "gpt-4-turbo-preview"
-                                
-                                response = clients['openai'].chat.completions.create(
-                                    model=model_name,
-                                    messages=[
-                                        {"role": "system", "content": "You are a strategic business intelligence system providing executive-level analysis."},
-                                        {"role": "user", "content": analysis_prompt}
-                                    ],
-                                    temperature=0.7,
-                                    max_tokens=1500
-                                )
-                                
-                                # Display the intelligent analysis
-                                st.markdown("### 🎯 AI Intelligence Analysis")
-                                st.markdown(response.choices[0].message.content)
-                                
-                                # Show confidence and sources
-                                col1, col2, col3 = st.columns(3)
-                                with col1:
-                                    avg_relevance = sum(m.score for m in results.matches[:15]) / min(len(results.matches), 15)
-                                    st.metric("Analysis Confidence", f"{avg_relevance:.1%}")
-                                with col2:
-                                    st.metric("Meetings Analyzed", len(meeting_contents))
-                                with col3:
-                                    st.metric("Search Cost", f"${search_cost:.4f}")
-                                
-                                # Source meetings
-                                with st.expander("📄 Source Meetings Used for Analysis"):
-                                    for i, match in enumerate(results.matches[:10], 1):
-                                        metadata = match.metadata
-                                        st.write(f"**{i}.** {metadata.get('id', 'Meeting')} - Relevance: {match.score:.1%}")
-                    
-                    # 3. TEMPORAL QUERIES - Time-based intelligence
-                    elif any(word in query_lower for word in ['recent', 'latest', 'last', 'yesterday', 'today', 'this week', 'this month', 'timeline']):
-                        
-                        st.info("📅 Analyzing temporal patterns...")
-                        
-                        embedding = clients['openai'].embeddings.create(
-                            input=search_query + " recent latest timeline",
-                            model="text-embedding-ada-002"
-                        ).data[0].embedding
-                        
-                        results = clients['index'].query(
-                            vector=embedding,
-                            top_k=15,
-                            include_metadata=True
-                        )
-                        
-                        if results.matches:
-                            st.subheader("📅 Time-Based Intelligence")
-                            
-                            # Group by time periods
-                            time_groups = {}
-                            for match in results.matches:
-                                metadata = match.metadata
-                                date = metadata.get('date', 'Unknown')
-                                if date not in time_groups:
-                                    time_groups[date] = []
-                                time_groups[date].append(metadata)
-                            
-                            # Display chronologically
-                            for date in sorted(time_groups.keys(), reverse=True)[:10]:
-                                with st.container():
-                                    st.write(f"**📅 {date}**")
-                                    for meeting in time_groups[date]:
-                                        content = meeting.get('text', meeting.get('content', ''))[:200]
-                                        st.write(f"• {content}...")
-                                    st.divider()
-                            
-                            st.info(f"💰 Search Cost: ${search_cost:.4f}")
-                    
-                    # 4. COMPETITIVE/STRATEGIC QUERIES
-                    elif any(word in query_lower for word in ['competitive', 'competitor', 'competition', 'versus', 'vs', 'compare', 'comparison', 'google', 'meta', 'teads', 'outbrain']):
-                        
-                        st.info("🎯 Performing competitive intelligence analysis...")
-                        
-                        embedding = clients['openai'].embeddings.create(
-                            input=search_query + " competitor competitive comparison strategy",
-                            model="text-embedding-ada-002"
-                        ).data[0].embedding
-                        
-                        results = clients['index'].query(
-                            vector=embedding,
-                            top_k=15,
-                            include_metadata=True
-                        )
-                        
-                        if results.matches:
-                            # Collect competitive intelligence
-                            competitive_data = []
-                            for match in results.matches:
-                                metadata = match.metadata
-                                content = metadata.get('text', metadata.get('content', ''))
-                                if content:
-                                    competitive_data.append(content[:500])
-                            
-                            if competitive_data:
-                                # AI Competitive Analysis
-                                competitive_prompt = f"""
-                                Analyze competitive intelligence from these meetings about: {search_query}
-                                
-                                Data: {' '.join(competitive_data[:8])}
-                                
-                                Provide:
-                                1. **Competitive Landscape** - Who are the main competitors and their positioning?
-                                2. **Our Strengths vs Competition** - Where do we win?
-                                3. **Competitive Threats** - What should we watch for?
-                                4. **Win/Loss Patterns** - Why do we win or lose deals?
-                                5. **Strategic Recommendations** - How to improve competitive position?
-                                
-                                Be specific and actionable.
-                                """
-                                
-                                model_name = "gpt-3.5-turbo" if "3.5" in ai_model else "gpt-4-turbo-preview"
-                                
-                                response = clients['openai'].chat.completions.create(
-                                    model=model_name,
-                                    messages=[
-                                        {"role": "system", "content": "You are a competitive intelligence analyst."},
-                                        {"role": "user", "content": competitive_prompt}
-                                    ],
-                                    temperature=0.7,
-                                    max_tokens=1200
-                                )
-                                
-                                st.markdown("### ⚔️ Competitive Intelligence Analysis")
-                                st.markdown(response.choices[0].message.content)
-                                
-                                st.info(f"💰 Analysis Cost: ${search_cost:.4f} | Model: {ai_model}")
-                    
-                    # 5. DEFAULT INTELLIGENT SEARCH - With smart context
-                    else:
-                        embedding = clients['openai'].embeddings.create(
-                            input=search_query,
-                            model="text-embedding-ada-002"
-                        ).data[0].embedding
-                        
-                        results = clients['index'].query(
-                            vector=embedding,
-                            top_k=8,
-                            include_metadata=True
-                        )
-                        
-                        if results.matches:
-                            st.subheader(f"🔍 Intelligent Search Results for: '{search_query}'")
-                            
-                            # Quick AI summary of results
-                            if len(results.matches) > 3:
-                                summary_content = [m.metadata.get('text', m.metadata.get('content', ''))[:200] for m in results.matches[:5]]
-                                
-                                quick_summary_prompt = f"In 2-3 sentences, summarize these search results for '{search_query}': {' '.join(summary_content)}"
-                                
-                                model_name = "gpt-3.5-turbo" if "3.5" in ai_model else "gpt-4-turbo-preview"
-                                
-                                summary_response = clients['openai'].chat.completions.create(
-                                    model=model_name,
-                                    messages=[{"role": "user", "content": quick_summary_prompt}],
-                                    temperature=0.5,
-                                    max_tokens=150
-                                )
-                                
-                                st.success(f"**Quick Summary:** {summary_response.choices[0].message.content}")
-                            
-                            # Display results with intelligence
-                            for i, match in enumerate(results.matches, 1):
-                                metadata = match.metadata
-                                score = match.score
-                                
-                                with st.container():
-                                    col1, col2 = st.columns([3, 1])
-                                    with col1:
-                                        st.write(f"**{i}. {metadata.get('id', f'Result {i}')}**")
-                                    with col2:
-                                        st.write(f"📊 {score:.1%} match")
-                                    
-                                    # Display available metadata intelligently
-                                    content = metadata.get('text', metadata.get('content', ''))
-                                    if content:
-                                        st.write(f"💬 {content[:300]}...")
-                                    
-                                    if metadata.get('date'):
-                                        st.write(f"📅 {metadata.get('date')}")
-                                    
-                                    if metadata.get('attendees'):
-                                        st.write(f"👥 {metadata.get('attendees')}")
-                                    
-                                    st.divider()
-                            
-                            st.info(f"💰 Search Cost: ${search_cost:.4f} | Total Session: ${st.session_state.total_cost:.2f}")
-                        else:
-                            st.warning(f"No results found for '{search_query}'")
-                            st.info("""
-                            **💡 Search Tips:**
-                            - For themes: "What are the main themes across client meetings?"
-                            - For insights: "Analyze patterns in SPH discussions"
-                            - For competitive: "How do we compare to Google?"
-                            - For timeline: "Show recent Mediacorp meetings"
-                            """)
-                            
-                except Exception as e:
-                    st.error(f"Search error: {str(e)}")
-                    st.info("Try refreshing the page or rephrasing your query.")
-            else:
-                st.warning("Please enter a search query")
-                
-                # Show example queries
-                st.info("""
-                **🎯 Intelligent Queries You Can Try:**
-                - What are the main themes across all client meetings in the last 3 months?
-                - Analyze our competitive position against Google and Meta
-                - What patterns emerge from SPH meetings?
-                - Summarize key insights from Mediacorp discussions
-                - What are the critical action items across all accounts?
-                - Show me the timeline of Astra International engagement
-                """)
+                    pinecone_results = clients['index'].query(
+                        vector=search_embedding,
+                        top_k=5,
+                        include_metadata=True
+                    )
+                    results['meetings'] = [match.metadata.get('text', '') for match in pinecone_results.matches]
+                except:
+                    results['meetings'] = []
+            
+            if "Pipeline" in data_sources and not df_pipeline.empty:
+                # Search pipeline data
+                pipeline_matches = df_pipeline[
+                    df_pipeline['Name'].str.contains(search_query, case=False, na=False) |
+                    df_pipeline['Account_Name'].str.contains(search_query, case=False, na=False)
+                ]
+                if not pipeline_matches.empty:
+                    results['pipeline'] = [f"{row['Name']} - ${row['Amount']:,.0f} - {row['Stage']}" 
+                                          for _, row in pipeline_matches.head(5).iterrows()]
+            
+            # Display results
+            for source, items in results.items():
+                if items:
+                    st.markdown(f"### 📌 From {source.upper()}")
+                    for item in items:
+                        st.write(f"• {item}")
 
-# TAB 3: ACTION TRACKER
-with main_tab3:
-    st.markdown("## 📋 Action Tracker")
-    
-    col1, col2, col3 = st.columns([1, 1, 1])
-    
-    with col1:
-        if st.button("➕ Add Action", type="primary", use_container_width=True):
-            st.info("Action form would appear here")
-    
-    with col2:
-        filter_option = st.selectbox("Filter", ["All", "Open", "In Progress", "Completed"])
-    
-    with col3:
-        sort_option = st.selectbox("Sort by", ["Due Date", "Priority", "Account"])
-    
-    # Sample actions with more detail
-    actions_data = {
-        "Action": [
-            "Follow up on SPH pricing proposal",
-            "Mediacorp Q1 review preparation",
-            "Astra renewal documentation",
-            "Google compete strategy review",
-            "Team hiring - Senior AM Singapore"
-        ],
-        "Account": ["SPH", "Mediacorp", "Astra International", "Internal", "Internal"],
-        "Due Date": ["2024-12-16", "2024-12-17", "2024-12-18", "2024-12-20", "2024-12-31"],
-        "Priority": ["🔴 High", "🟡 Medium", "🔴 High", "🟡 Medium", "🟢 Low"],
-        "Status": ["🔄 Open", "⏳ In Progress", "🔄 Open", "⏳ In Progress", "🔄 Open"],
-        "Owner": ["Aaron", "Aaron", "Aaron", "Team", "HR"]
-    }
-    
-    df_actions = pd.DataFrame(actions_data)
-    st.dataframe(df_actions, use_container_width=True, hide_index=True)
-
-# TAB 4: CRM & OUTREACH
+# TAB 4: ACTION TRACKER
 with main_tab4:
-    st.markdown("## 👥 CRM & Outreach Intelligence")
+    st.markdown("## ✅ Action Item Tracker")
     
-    col1, col2 = st.columns([1, 1])
+    # Add new action
+    with st.expander("➕ Add New Action"):
+        col1, col2, col3 = st.columns([3, 1, 1])
+        with col1:
+            new_action = st.text_input("Action item:")
+        with col2:
+            priority = st.selectbox("Priority:", ["High", "Medium", "Low"])
+        with col3:
+            if st.button("Add"):
+                st.session_state.action_items.append({
+                    'task': new_action,
+                    'priority': priority,
+                    'added': datetime.now(),
+                    'status': 'Open'
+                })
+    
+    # Display actions by priority
+    high_priority = [a for a in st.session_state.action_items if a.get('priority') == 'High']
+    medium_priority = [a for a in st.session_state.action_items if a.get('priority') == 'Medium']
+    
+    col1, col2 = st.columns(2)
     
     with col1:
-        st.markdown("### 🏢 Account Intelligence")
-        account = st.selectbox("Select Account", ["SPH", "Mediacorp", "Astra International", "Google", "Meta"])
-        
-        if st.button("🧠 Generate Account Intelligence", use_container_width=True):
-            with st.spinner("Analyzing account data..."):
-                # This would query your meetings and generate insights
-                cost = calculate_search_cost("GPT-4", 200, 800)
-                st.session_state.total_cost += cost
-                
-                st.markdown(f"""
-                ### {account} Intelligence Report
-                
-                **📊 Account Health:** 🟢 Strong
-                
-                **Key Metrics:**
-                - Last Meeting: 2 days ago
-                - Renewal Date: Q1 2025
-                - Revenue YTD: $1.2M (+23% YoY)
-                - Pipeline: $450K
-                
-                **Relationship Map:**
-                - Champion: John Smith (Head of Digital)
-                - Decision Maker: Sarah Chen (CMO)
-                - Influencer: Mike Tan (Procurement)
-                
-                **Recent Sentiment:** Positive - exploring expansion
-                
-                **Next Steps:**
-                1. Schedule Q1 planning session
-                2. Present video ad solutions
-                3. Negotiate renewal terms
-                
-                *Analysis Cost: ${cost:.4f}*
-                """)
+        st.markdown("### 🔴 High Priority")
+        for action in high_priority:
+            st.checkbox(action['task'], key=f"action_{action['task']}")
     
     with col2:
-        st.markdown("### 📧 AI-Powered Outreach")
-        
-        email_purpose = st.selectbox(
-            "Email Purpose",
-            ["Follow-up", "Proposal", "Check-in", "Renewal", "Upsell", "Thank you"]
-        )
-        
-        if st.button("🤖 Generate Smart Email", use_container_width=True):
-            cost = calculate_search_cost("GPT-3.5", 100, 400)
-            st.session_state.total_cost += cost
-            
-            email_template = f"""Subject: Following up on our pricing discussion - Next steps
+        st.markdown("### 🟡 Medium Priority")
+        for action in medium_priority:
+            st.checkbox(action['task'], key=f"action_med_{action['task']}")
 
-Hi [Name],
-
-Thank you for taking the time to discuss the Q1 campaign strategy yesterday. I've been thinking about your points regarding audience targeting in the Singapore market.
-
-Based on our conversation, I'd like to propose:
-1. A pilot campaign focusing on your key demographics
-2. Enhanced reporting dashboard for real-time optimization
-3. Dedicated account support for the launch phase
-
-Would you be available for a 30-minute call next Tuesday to review the detailed proposal?
-
-Best regards,
-Aaron
-
-*Generated with {email_purpose} template | Cost: ${cost:.4f}*"""
-            
-            st.text_area("Generated Email", value=email_template, height=250)
-
-# TAB 5: PERFORMANCE (QLIK)
+# TAB 5: CRM & OUTREACH
 with main_tab5:
-    st.markdown("## 📊 Performance Dashboard")
+    st.markdown("## 💥 CRM & Intelligent Outreach")
     
-    # Performance metrics
-    col1, col2, col3, col4 = st.columns(4)
+    crm_tab1, crm_tab2, crm_tab3 = st.tabs(["Contacts", "Outreach Queue", "LinkedIn Monitor"])
     
-    with col1:
-        st.metric("Q4 Target", "$4.5M", "87% achieved", delta_color="normal")
-    
-    with col2:
-        st.metric("YTD Growth", "+34%", "vs 2023", delta_color="normal")
-    
-    with col3:
-        st.metric("Pipeline Coverage", "3.2x", "+0.5x QoQ", delta_color="normal")
-    
-    with col4:
-        st.metric("Client Retention", "94%", "+2%", delta_color="normal")
-    
-    # Revenue trend chart
-    dates = pd.date_range(start='2024-01-01', end='2024-12-31', freq='M')
-    revenue = [1.2, 1.5, 1.8, 2.1, 2.3, 2.5, 2.4, 2.6, 2.8, 3.0, 3.2, 3.5]
-    target = [1.5, 1.5, 1.5, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5, 3.0, 3.0, 3.5]
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dates, y=revenue, mode='lines+markers', name='Actual Revenue', line=dict(color='green', width=3)))
-    fig.add_trace(go.Scatter(x=dates, y=target, mode='lines', name='Target', line=dict(color='gray', dash='dash')))
-    fig.update_layout(
-        title='2024 Revenue Performance ($M)',
-        xaxis_title='Month',
-        yaxis_title='Revenue ($M)',
-        hovermode='x unified'
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Account performance
-    st.markdown("### 🏢 Top Account Performance")
-    
-    account_data = {
-        "Account": ["SPH", "Mediacorp", "Astra International", "Grab", "Shopee"],
-        "Q4 Revenue": ["$1.2M", "$980K", "$750K", "$620K", "$550K"],
-        "YoY Growth": ["+23%", "+45%", "+12%", "+67%", "+89%"],
-        "Health": ["🟢", "🟢", "🟡", "🟢", "🟢"],
-        "Renewal Risk": ["Low", "Low", "Medium", "Low", "Low"]
-    }
-    
-    df_accounts = pd.DataFrame(account_data)
-    st.dataframe(df_accounts, use_container_width=True, hide_index=True)
-
-# TAB 6: AUTOMATION
-with main_tab6:
-    st.markdown("## 🤖 Automation Hub")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.markdown("### ⚡ Active Automations")
+    with crm_tab1:
+        # Contact management
+        st.markdown("### 📋 Contact Database")
         
-        automations = {
-            "Automation": [
-                "Meeting Capture (Otter → Notion)",
-                "Daily Intelligence Brief",
-                "Outreach Queue Processing",
-                "Qlik Performance Alerts",
-                "CRM Enrichment"
-            ],
-            "Status": ["🟢 Active", "🟢 Active", "🟡 Paused", "🟢 Active", "🔴 Error"],
-            "Last Run": ["2 hours ago", "This morning 8am", "3 days ago", "1 hour ago", "Failed"],
-            "Next Run": ["Continuous", "Tomorrow 8am", "Manual", "In 2 hours", "Needs fix"],
-            "Success Rate": ["98%", "100%", "95%", "100%", "0%"]
+        # Sample contacts display
+        contacts_df = pd.DataFrame({
+            'Name': ['John Smith', 'Jane Doe', 'Michael Chen'],
+            'Company': ['SPH', 'Mediacorp', 'Astra'],
+            'Last Contact': ['2 days ago', '1 week ago', '3 days ago'],
+            'Relationship': [9, 7, 8]
+        })
+        
+        st.dataframe(contacts_df, use_container_width=True)
+    
+    with crm_tab2:
+        st.markdown("### ✉️ Outreach Queue")
+        
+        # Sample outreach items
+        outreach_items = [
+            {
+                'contact': 'John Smith',
+                'trigger': 'News: SPH Digital Growth',
+                'email': 'Hi John, Saw the news about SPH\'s digital growth...'
+            }
+        ]
+        
+        for item in outreach_items:
+            with st.expander(f"📧 {item['contact']} - {item['trigger']}"):
+                st.text_area("Email:", item['email'], height=100)
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.button(f"✅ Send", key=f"send_{item['contact']}")
+                with col2:
+                    st.button(f"✏️ Edit", key=f"edit_{item['contact']}")
+    
+    with crm_tab3:
+        st.markdown("### 🔍 LinkedIn Changes")
+        if st.button("Check All LinkedIn Profiles"):
+            st.info("Checking 47 LinkedIn profiles...")
+
+# TAB 6: QLIK PERFORMANCE
+with main_tab6:
+    st.markdown("## 📊 Qlik Performance Monitor")
+    
+    # KPI Metrics
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("Revenue", "$45,230", delta="-12%", delta_color="inverse")
+    with col2:
+        st.metric("CTR", "2.3%", delta="+0.2%")
+    with col3:
+        st.metric("CPM", "$4.50", delta="+$0.30", delta_color="inverse")
+    with col4:
+        st.metric("Fill Rate", "87%", delta="-3%", delta_color="inverse")
+    with col5:
+        st.metric("Viewability", "72%", delta="+5%")
+    
+    # Alerts
+    st.markdown("### 🚨 Performance Alerts")
+    st.error("**SPH**: CTR dropped 15% - investigate ad fatigue")
+    st.warning("**Mediacorp**: Fill rate below 85% - check demand")
+    
+    # Upload new data
+    with st.expander("📤 Upload Today's Qlik Export"):
+        uploaded_file = st.file_uploader("Choose Qlik CSV/Excel", type=['csv', 'xlsx'])
+        if uploaded_file:
+            st.success("Processing Qlik data...")
+
+# TAB 7: AUTOMATION SETTINGS
+with main_tab7:
+    st.markdown("## ⚙️ Automation Configuration")
+    
+    auto_tab1, auto_tab2, auto_tab3 = st.tabs(["Schedules", "Integrations", "Logs"])
+    
+    with auto_tab1:
+        st.markdown("### ⏰ Automation Schedule")
+        
+        schedules = {
+            "Morning Brief": "6:00 AM",
+            "Pipeline Extract": "5:30 AM",
+            "Pipeline Process": "6:00 AM",
+            "LinkedIn Check": "12:00 PM",
+            "News Scan": "3:00 PM",
+            "Qlik Import": "5:00 PM",
+            "Daily Summary": "6:00 PM"
         }
         
-        df_auto = pd.DataFrame(automations)
-        st.dataframe(df_auto, use_container_width=True, hide_index=True)
+        for task, time in schedules.items():
+            col1, col2, col3 = st.columns([2, 1, 1])
+            with col1:
+                st.write(f"**{task}**")
+            with col2:
+                st.write(time)
+            with col3:
+                st.checkbox("Active", value=True, key=f"schedule_{task}")
     
-    with col2:
-        st.markdown("### 📈 Automation Stats")
-        st.metric("Time Saved/Week", "12 hours")
-        st.metric("Auto-processed", "47 items")
-        st.metric("Error Rate", "2.1%")
+    with auto_tab2:
+        st.markdown("### 🔗 Integration Status")
         
-        if st.button("🔧 Configure Automations", use_container_width=True):
-            st.info("Opening automation settings...")
+        integrations = {
+            "Notion": "✅ Connected",
+            "OpenAI": "✅ Connected",
+            "Pinecone": "✅ Connected",
+            "Salesforce": "✅ Via Email",
+            "Qlik": "⚠️ Manual Upload",
+            "LinkedIn": "⚠️ Setup Required",
+            "NewsAPI": "❌ Not Configured"
+        }
+        
+        for service, status in integrations.items():
+            st.write(f"**{service}:** {status}")
+    
+    with auto_tab3:
+        st.markdown("### 📜 Automation Logs")
+        if os.path.exists('/volume1/Shared/business_brain/logs/pipeline.log'):
+            with open('/volume1/Shared/business_brain/logs/pipeline.log', 'r') as f:
+                st.text_area("Pipeline Processing Log", value=f.read()[-1000:], height=200)
 
-# Footer with cost summary
-st.markdown("---")
-st.markdown(
-    f"""<center>
-    🧠 Business Brain Master v4.0 | {total_meetings} Meetings | 4000+ Knowledge Cards | Real-time Intelligence<br>
-    💰 Session Cost: ${st.session_state.total_cost:.4f} | Searches: {st.session_state.search_count} | Monthly Estimate: ${st.session_state.monthly_cost:.2f}<br>
-    Building your path to VP by 2028
-    </center>""",
-    unsafe_allow_html=True
-)
+# Sidebar
+with st.sidebar:
+    st.markdown("### 🎯 Quick Stats")
+    
+    if not df_pipeline.empty:
+        total_pipeline_value = df_pipeline['Amount'].sum()
+        deals_closing_soon = len(df_pipeline[df_pipeline['Stage'].str.contains('Proposal|Contract', na=False)])
+        
+        st.metric("Pipeline Value", f"${total_pipeline_value/1000000:.1f}M")
+        st.metric("Deals Closing Soon", deals_closing_soon)
+        st.metric("Time Saved This Week", "12 hours")
+    
+    st.divider()
+    
+    st.markdown("### 🚀 Quick Actions")
+    if st.button("🌅 Morning Brief", use_container_width=True):
+        st.session_state.show_brief = True
+    if st.button("💰 Pipeline Review", use_container_width=True):
+        st.session_state.show_pipeline = True
+    if st.button("📧 Outreach Queue", use_container_width=True):
+        st.session_state.show_outreach = True
+    if st.button("📊 Qlik Alerts", use_container_width=True):
+        st.session_state.show_qlik = True
+    
+    st.divider()
+    
+    st.markdown("### 📈 VP Progress")
+    st.progress(0.62)
+    st.caption("62% to VP by 2028")
+    
+    # Key milestones
+    st.markdown("""
+    **Milestones:**
+    - ✅ Built intelligence system
+    - ✅ Automated workflows
+    - ✅ Pipeline tracking live
+    - ⏳ Expand to 2 markets
+    - ⏳ Hit $10M revenue
+    - ⏳ Build strategic team
+    """)
+    
+    st.divider()
+    
+    # Refresh button
+    if st.button("🔄 Refresh All Data", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+# Footer
+st.divider()
+st.markdown("""
+<div style='text-align: center; color: #6b7280; padding: 1rem;'>
+    <p>🧠 Business Brain Master v5.0 | 354 Meetings | 143 Pipeline Deals | Real-time Intelligence</p>
+    <p>Building your path to VP by 2028</p>
+</div>
+""", unsafe_allow_html=True)
