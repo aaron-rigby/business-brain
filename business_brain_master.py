@@ -16,7 +16,7 @@ import json
 # PAGE CONFIGURATION
 # ============================================
 st.set_page_config(
-    page_title="Business Brain Master System",
+    page_title="Business Brain",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -275,6 +275,12 @@ def calculate_deal_velocity():
 def get_pipeline_trends():
     """Calculate pipeline trends over time"""
     df_history = get_pipeline_history()
+    
+    if df_history.empty:
+        return pd.DataFrame(), {}
+    
+    # Remove invalid dates
+    df_history = df_history[df_history['Date_Captured'].notna()]
     
     if df_history.empty:
         return pd.DataFrame(), {}
@@ -543,7 +549,7 @@ def calculate_metrics(df):
 # MAIN APPLICATION
 # ============================================
 def main():
-    st.title("🧠 Business Brain Master System")
+    # No title for minimal interface
     
     # Fetch data
     with st.spinner("Loading data..."):
@@ -604,10 +610,13 @@ def main():
     with tab1:
         st.header("Daily Intelligence Brief")
         
-        # Add date selector for historical view
-        if not df_history.empty:
-            available_dates = sorted(df_history['Date_Captured'].dt.date.unique(), reverse=True)
-            if available_dates:
+        # Add date selector for historical view (with error handling)
+        if not df_history.empty and 'Date_Captured' in df_history.columns:
+            # Filter out NaT values and get valid dates
+            valid_dates = df_history[df_history['Date_Captured'].notna()]['Date_Captured'].dt.date.unique()
+            
+            if len(valid_dates) > 0:
+                available_dates = sorted(valid_dates, reverse=True)
                 selected_date = st.date_input(
                     "View pipeline for date:",
                     value=available_dates[0],
@@ -653,9 +662,11 @@ def main():
         st.header("Salesforce Pipeline Analysis")
         
         # Show current snapshot info
-        if not df_history.empty:
-            latest_date = df_history['Date_Captured'].max()
-            st.info(f"📅 Showing current pipeline snapshot from: {latest_date.strftime('%Y-%m-%d %H:%M')}")
+        if not df_history.empty and 'Date_Captured' in df_history.columns:
+            valid_dates = df_history[df_history['Date_Captured'].notna()]['Date_Captured']
+            if not valid_dates.empty:
+                latest_date = valid_dates.max()
+                st.info(f"📅 Showing current pipeline snapshot from: {latest_date.strftime('%Y-%m-%d %H:%M')}")
         
         if not df.empty:
             # Filters
@@ -884,18 +895,20 @@ def main():
             
             # Stage progression analysis
             st.subheader("Stage Progression Over Time")
-            if not df_history.empty:
-                # Count deals by stage over time
-                stage_progression = df_history.groupby(['Date_Captured', 'Stage']).size().reset_index(name='Count')
-                
-                fig = px.area(
-                    stage_progression,
-                    x='Date_Captured',
-                    y='Count',
-                    color='Stage',
-                    title='Deal Distribution by Stage Over Time'
-                )
-                st.plotly_chart(fig, use_container_width=True)
+            if 'Date_Captured' in df_history.columns:
+                valid_history = df_history[df_history['Date_Captured'].notna()]
+                if not valid_history.empty:
+                    # Count deals by stage over time
+                    stage_progression = valid_history.groupby(['Date_Captured', 'Stage']).size().reset_index(name='Count')
+                    
+                    fig = px.area(
+                        stage_progression,
+                        x='Date_Captured',
+                        y='Count',
+                        color='Stage',
+                        title='Deal Distribution by Stage Over Time'
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
     
     with tab7:
         st.header("🤖 Automation Status")
@@ -907,10 +920,12 @@ def main():
             if df_history.empty:
                 st.error("❌ No data received")
             else:
-                latest_capture = df_history['Date_Captured'].max()
-                st.success("✅ Pipeline Processor: Active")
-                st.info(f"Last sync: {latest_capture.strftime('%Y-%m-%d %H:%M')}")
-                st.info(f"Records: {len(df_history)} total, {len(df)} current")
+                valid_dates = df_history[df_history['Date_Captured'].notna()]['Date_Captured']
+                if not valid_dates.empty:
+                    latest_capture = valid_dates.max()
+                    st.success("✅ Pipeline Processor: Active")
+                    st.info(f"Last sync: {latest_capture.strftime('%Y-%m-%d %H:%M')}")
+                    st.info(f"Records: {len(df_history)} total, {len(df)} current")
         
         with col2:
             st.subheader("💻 Mac Mini")
@@ -925,20 +940,22 @@ def main():
                 """, language="bash")
         
         st.subheader("📊 Data Quality Check")
-        if not df_history.empty:
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                unique_dates = df_history['Date_Captured'].dt.date.nunique()
-                st.metric("Capture Dates", unique_dates)
-            
-            with col2:
-                unique_opps = df_history['Opportunity'].nunique()
-                st.metric("Unique Opportunities", unique_opps)
-            
-            with col3:
-                avg_daily = len(df_history) / unique_dates if unique_dates > 0 else 0
-                st.metric("Avg Deals/Day", f"{avg_daily:.0f}")
+        if not df_history.empty and 'Date_Captured' in df_history.columns:
+            valid_history = df_history[df_history['Date_Captured'].notna()]
+            if not valid_history.empty:
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    unique_dates = valid_history['Date_Captured'].dt.date.nunique()
+                    st.metric("Capture Dates", unique_dates)
+                
+                with col2:
+                    unique_opps = valid_history['Opportunity'].nunique()
+                    st.metric("Unique Opportunities", unique_opps)
+                
+                with col3:
+                    avg_daily = len(valid_history) / unique_dates if unique_dates > 0 else 0
+                    st.metric("Avg Deals/Day", f"{avg_daily:.0f}")
     
     # Sidebar
     st.sidebar.header("📊 System Overview")
@@ -951,8 +968,9 @@ def main():
     
     if not df_history.empty:
         st.sidebar.info(f"📚 {len(df_history)} historical records")
-        unique_dates = df_history['Date_Captured'].dt.date.nunique()
-        st.sidebar.info(f"📅 {unique_dates} days of data")
+        if 'Date_Captured' in df_history.columns:
+            valid_dates = df_history[df_history['Date_Captured'].notna()]['Date_Captured'].dt.date.nunique()
+            st.sidebar.info(f"📅 {valid_dates} days of data")
     
     if DEBUG_MODE:
         st.sidebar.header("🔧 Debug Info")
