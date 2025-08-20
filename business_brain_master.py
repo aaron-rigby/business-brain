@@ -9,6 +9,7 @@ from pinecone import Pinecone, ServerlessSpec
 import os
 import traceback
 import time
+import json
 
 # ============================================
 # PAGE CONFIGURATION
@@ -36,6 +37,7 @@ def get_credentials():
         return {
             "NOTION_TOKEN": "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",
             "PIPELINE_DB_ID": "24d6e7c238388037b0d1eb52ba9c2b29",
+            "MEETING_DB_ID": st.secrets.get("MEETING_DB_ID", ""),
             "OPENAI_API_KEY": st.secrets.get("OPENAI_API_KEY", ""),
             "PINECONE_API_KEY": st.secrets.get("PINECONE_API_KEY", ""),
             "PINECONE_INDEX_NAME": st.secrets.get("PINECONE_INDEX_NAME", "business-brain"),
@@ -45,6 +47,7 @@ def get_credentials():
             return {
                 "NOTION_TOKEN": st.secrets.get("NOTION_TOKEN"),
                 "PIPELINE_DB_ID": st.secrets.get("PIPELINE_DB_ID"),
+                "MEETING_DB_ID": st.secrets.get("MEETING_DB_ID", ""),
                 "OPENAI_API_KEY": st.secrets.get("OPENAI_API_KEY", ""),
                 "PINECONE_API_KEY": st.secrets.get("PINECONE_API_KEY", ""),
                 "PINECONE_INDEX_NAME": st.secrets.get("PINECONE_INDEX_NAME", "business-brain"),
@@ -54,9 +57,9 @@ def get_credentials():
             return None
 
 # ============================================
-# NOTION CONNECTION
+# NOTION CONNECTION - FIXED CACHING
 # ============================================
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+@st.cache_resource  # Use cache_resource for connection objects
 def get_notion_client():
     """Initialize Notion client with caching"""
     creds = get_credentials()
@@ -78,8 +81,7 @@ def get_notion_client():
 # ============================================
 # PIPELINE DATA FETCHING - WITH PAGINATION
 # ============================================
-@st.cache_data(ttl=60)  # Cache for 1 minute
-def get_pipeline_data():
+def get_pipeline_data():  # No caching to avoid serialization issues
     """Fetch ALL pipeline data from Notion with pagination"""
     notion = get_notion_client()
     if not notion:
@@ -95,7 +97,7 @@ def get_pipeline_data():
     try:
         # Query the database - GET ALL RECORDS WITH PAGINATION
         if DEBUG_MODE:
-            st.write(f"📊 Querying database: {database_id}")
+            st.write(f"📊 Querying pipeline database: {database_id}")
         
         # Fetch ALL pages, not just first 100
         all_results = []
@@ -104,7 +106,7 @@ def get_pipeline_data():
         page_count = 0
         
         while has_more:
-            if DEBUG_MODE:
+            if DEBUG_MODE and page_count > 0:
                 st.write(f"Fetching page {page_count + 1}...")
             
             response = notion.databases.query(
@@ -119,9 +121,7 @@ def get_pipeline_data():
             page_count += 1
         
         if DEBUG_MODE:
-            st.write(f"✅ Got {len(all_results)} total items across {page_count} pages")
-            if all_results:
-                st.write("First item properties:", list(all_results[0].get('properties', {}).keys()))
+            st.write(f"✅ Got {len(all_results)} total deals across {page_count} pages")
         
         if not all_results:
             st.info("Database is connected but contains no deals")
@@ -132,11 +132,6 @@ def get_pipeline_data():
         for idx, item in enumerate(all_results):
             try:
                 props = item.get('properties', {})
-                
-                # Debug first item structure
-                if DEBUG_MODE and idx == 0:
-                    st.write("Sample deal structure:")
-                    st.json(props)
                 
                 # Get amount
                 amount = 0
@@ -200,10 +195,7 @@ def get_pipeline_data():
         
         if DEBUG_MODE:
             st.write(f"✅ Processed {len(df)} deals")
-            st.write("DataFrame shape:", df.shape)
             st.write("Total pipeline value: ${:,.2f}".format(df['Amount'].sum()))
-            st.write("Sample data:")
-            st.dataframe(df.head())
         
         return df
         
@@ -214,7 +206,263 @@ def get_pipeline_data():
         return pd.DataFrame()
 
 # ============================================
-# INTELLIGENCE SEARCH (PINECONE + OPENAI)
+# MEETING INTELLIGENCE DATA FETCHING
+# ============================================
+def get_meeting_intelligence():
+    """Fetch meeting intelligence from Notion"""
+    notion = get_notion_client()
+    if not notion:
+        return pd.DataFrame()
+    
+    creds = get_credentials()
+    database_id = creds.get("MEETING_DB_ID")
+    
+    if not database_id:
+        if DEBUG_MODE:
+            st.info("Meeting Intelligence DB not configured in secrets")
+        return pd.DataFrame()
+    
+    try:
+        if DEBUG_MODE:
+            st.write(f"📅 Querying meeting database: {database_id}")
+        
+        # Fetch all meeting records with pagination
+        all_results = []
+        has_more = True
+        next_cursor = None
+        
+        while has_more:
+            response = notion.databases.query(
+                database_id=database_id,
+                page_size=100,
+                start_cursor=next_cursor
+            )
+            
+            all_results.extend(response.get('results', []))
+            has_more = response.get('has_more', False)
+            next_cursor = response.get('next_cursor', None)
+        
+        if DEBUG_MODE:
+            st.write(f"✅ Got {len(all_results)} meeting records")
+        
+        # Process meeting records
+        meetings = []
+        for item in all_results:
+            try:
+                props = item.get('properties', {})
+                
+                # Try different field name variations for meeting data
+                # Date field
+                meeting_date = None
+                for date_field in ['Meeting_Date', 'Date', 'When', 'Created_Date']:
+                    if date_field in props:
+                        date_prop = props[date_field]
+                        if 'date' in date_prop and date_prop['date']:
+                            meeting_date = date_prop['date'].get('start', '')
+                            break
+                
+                # Participants/Company field
+                participants = ""
+                for part_field in ['Participants', 'Attendees', 'Company', 'Who', 'Contact']:
+                    if part_field in props:
+                        part_prop = props[part_field]
+                        if 'rich_text' in part_prop:
+                            texts = part_prop.get('rich_text', [])
+                            if texts:
+                                participants = texts[0].get('plain_text', '')
+                                break
+                        elif 'title' in part_prop:
+                            titles = part_prop.get('title', [])
+                            if titles:
+                                participants = titles[0].get('plain_text', '')
+                                break
+                
+                # Notes/Content field
+                notes = ""
+                for notes_field in ['Notes', 'Content', 'Summary', 'Description', 'Details']:
+                    if notes_field in props:
+                        notes_prop = props[notes_field]
+                        if 'rich_text' in notes_prop:
+                            texts = notes_prop.get('rich_text', [])
+                            if texts:
+                                notes = texts[0].get('plain_text', '')
+                                break
+                
+                # Key themes/topics
+                themes = ""
+                for theme_field in ['Key_Themes', 'Topics', 'Themes', 'Subject']:
+                    if theme_field in props:
+                        theme_prop = props[theme_field]
+                        if 'rich_text' in theme_prop:
+                            texts = theme_prop.get('rich_text', [])
+                            if texts:
+                                themes = texts[0].get('plain_text', '')
+                                break
+                
+                # Action items
+                actions = ""
+                for action_field in ['Action_Items', 'Actions', 'Next_Steps', 'Follow_Up']:
+                    if action_field in props:
+                        action_prop = props[action_field]
+                        if 'rich_text' in action_prop:
+                            texts = action_prop.get('rich_text', [])
+                            if texts:
+                                actions = texts[0].get('plain_text', '')
+                                break
+                
+                meetings.append({
+                    'Date': meeting_date,
+                    'Participants': participants,
+                    'Notes': notes,
+                    'Key_Themes': themes,
+                    'Action_Items': actions,
+                })
+                
+            except Exception as e:
+                if DEBUG_MODE:
+                    st.write(f"Error processing meeting record: {e}")
+                continue
+        
+        df = pd.DataFrame(meetings)
+        
+        if DEBUG_MODE and not df.empty:
+            st.write(f"✅ Processed {len(df)} meetings")
+        
+        return df
+        
+    except Exception as e:
+        if DEBUG_MODE:
+            st.error(f"Failed to fetch meetings: {e}")
+            st.write("Full error:", traceback.format_exc())
+        return pd.DataFrame()
+
+# ============================================
+# AI-POWERED SEARCH WITH OPENAI
+# ============================================
+def search_with_ai(query):
+    """Use OpenAI to search and summarize across all data sources"""
+    creds = get_credentials()
+    
+    if not creds.get("OPENAI_API_KEY"):
+        # Fallback to basic search without AI
+        return basic_search(query)
+    
+    try:
+        # Initialize OpenAI
+        openai.api_key = creds["OPENAI_API_KEY"]
+        
+        # Get all available data
+        pipeline_df = get_pipeline_data()
+        meetings_df = get_meeting_intelligence()
+        
+        # Build context from available data
+        context_parts = []
+        
+        # Add pipeline context if query seems pipeline-related
+        pipeline_keywords = ['deal', 'pipeline', 'opportunity', 'sales', 'revenue', 'close', 'stage']
+        if any(keyword in query.lower() for keyword in pipeline_keywords) and not pipeline_df.empty:
+            relevant_deals = pipeline_df[
+                pipeline_df.apply(lambda row: any(
+                    term in str(row).lower() 
+                    for term in query.lower().split()
+                ), axis=1)
+            ].head(10)
+            
+            if not relevant_deals.empty:
+                context_parts.append("RELEVANT DEALS:\n" + relevant_deals.to_string())
+        
+        # Add meeting context if query seems meeting-related or mentions specific people/companies
+        if not meetings_df.empty:
+            # Check for "today", "yesterday", "this week" etc.
+            today = datetime.now().date()
+            yesterday = today - timedelta(days=1)
+            week_ago = today - timedelta(days=7)
+            
+            relevant_meetings = meetings_df[
+                meetings_df.apply(lambda row: any(
+                    term in str(row).lower() 
+                    for term in query.lower().split()
+                ), axis=1)
+            ].head(5)
+            
+            if not relevant_meetings.empty:
+                meeting_context = []
+                for _, meeting in relevant_meetings.iterrows():
+                    meeting_text = f"""
+Meeting Date: {meeting.get('Date', 'Unknown')}
+Participants: {meeting.get('Participants', 'Unknown')}
+Notes: {meeting.get('Notes', 'No notes')}
+Key Themes: {meeting.get('Key_Themes', 'No themes')}
+Action Items: {meeting.get('Action_Items', 'No actions')}
+---"""
+                    meeting_context.append(meeting_text)
+                
+                context_parts.append("RELEVANT MEETINGS:\n" + "\n".join(meeting_context))
+        
+        if not context_parts:
+            return "No relevant data found for your query."
+        
+        # Combine all context
+        full_context = "\n\n".join(context_parts)
+        
+        # Use OpenAI to answer the query
+        messages = [
+            {
+                "role": "system", 
+                "content": """You are an intelligent business assistant analyzing sales pipeline and meeting data. 
+                Provide clear, concise answers based on the data provided. If the data doesn't contain 
+                the answer, say so clearly. Format your responses with bullet points where appropriate."""
+            },
+            {
+                "role": "user", 
+                "content": f"Based on the following data, answer this question: {query}\n\nDATA:\n{full_context}"
+            }
+        ]
+        
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            max_tokens=500,
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        if DEBUG_MODE:
+            st.error(f"AI search error: {e}")
+        return basic_search(query)
+
+def basic_search(query):
+    """Fallback basic search without AI"""
+    results = []
+    
+    # Search in pipeline data
+    pipeline_df = get_pipeline_data()
+    if not pipeline_df.empty:
+        pipeline_matches = pipeline_df[
+            pipeline_df.apply(lambda row: query.lower() in str(row).lower(), axis=1)
+        ]
+        if not pipeline_matches.empty:
+            results.append(f"**Pipeline Matches ({len(pipeline_matches)} deals):**")
+            for _, deal in pipeline_matches.head(5).iterrows():
+                results.append(f"• {deal['Opportunity']} - {deal['Account']} (${deal['Amount']:,.0f})")
+    
+    # Search in meetings
+    meetings_df = get_meeting_intelligence()
+    if not meetings_df.empty:
+        meeting_matches = meetings_df[
+            meetings_df.apply(lambda row: query.lower() in str(row).lower(), axis=1)
+        ]
+        if not meeting_matches.empty:
+            results.append(f"\n**Meeting Matches ({len(meeting_matches)} meetings):**")
+            for _, meeting in meeting_matches.head(5).iterrows():
+                results.append(f"• {meeting.get('Date', 'Unknown date')} - {meeting.get('Participants', 'Unknown participants')}")
+    
+    return "\n".join(results) if results else "No matches found for your search query."
+
+# ============================================
+# PINECONE VECTOR SEARCH (OPTIONAL)
 # ============================================
 @st.cache_resource
 def init_pinecone():
@@ -227,62 +475,16 @@ def init_pinecone():
         pc = Pinecone(api_key=creds["PINECONE_API_KEY"])
         index_name = creds.get("PINECONE_INDEX_NAME", "business-brain")
         
-        # Check if index exists
         if index_name in pc.list_indexes().names():
             return pc.Index(index_name)
         else:
-            st.warning(f"Pinecone index '{index_name}' not found")
+            if DEBUG_MODE:
+                st.warning(f"Pinecone index '{index_name}' not found")
             return None
     except Exception as e:
         if DEBUG_MODE:
             st.error(f"Failed to initialize Pinecone: {e}")
         return None
-
-def search_intelligence(query, k=5):
-    """Search across all data sources using Pinecone"""
-    creds = get_credentials()
-    
-    # Check for OpenAI API key
-    if not creds or not creds.get("OPENAI_API_KEY"):
-        st.warning("OpenAI API key not configured. Add it to Streamlit secrets to enable intelligence search.")
-        return []
-    
-    # Initialize OpenAI
-    openai.api_key = creds["OPENAI_API_KEY"]
-    
-    # Get Pinecone index
-    index = init_pinecone()
-    if not index:
-        st.info("Intelligence search requires Pinecone setup. Using basic search instead.")
-        # Fallback to basic DataFrame search
-        df = get_pipeline_data()
-        if not df.empty and query:
-            # Simple text search in pipeline data
-            mask = df.apply(lambda row: query.lower() in str(row).lower(), axis=1)
-            results = df[mask]
-            return results.to_dict('records') if not results.empty else []
-        return []
-    
-    try:
-        # Generate embedding for query
-        response = openai.Embedding.create(
-            input=query,
-            model="text-embedding-ada-002"
-        )
-        query_embedding = response['data'][0]['embedding']
-        
-        # Search Pinecone
-        results = index.query(
-            vector=query_embedding,
-            top_k=k,
-            include_metadata=True
-        )
-        
-        return results['matches'] if results else []
-        
-    except Exception as e:
-        st.error(f"Search failed: {e}")
-        return []
 
 # ============================================
 # METRICS CALCULATION
@@ -327,15 +529,16 @@ def main():
     # Header
     st.title("🧠 Business Brain Master System")
     
-    # Fetch pipeline data
-    with st.spinner("Loading pipeline data..."):
+    # Fetch data
+    with st.spinner("Loading data..."):
         df = get_pipeline_data()
+        meetings_df = get_meeting_intelligence()
     
     # Calculate metrics
     metrics = calculate_metrics(df)
     
-    # Display main metrics (only real data)
-    col1, col2, col3 = st.columns(3)
+    # Display main metrics
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric(
@@ -358,13 +561,21 @@ def main():
             delta=None
         )
     
+    with col4:
+        st.metric(
+            "📅 Meetings Tracked",
+            len(meetings_df) if not meetings_df.empty else 0,
+            delta=None
+        )
+    
     # Tabs for different views
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🏠 Command Center",
         "💰 Salesforce Pipeline",
         "🔍 Intelligence Search",
-        "📊 Pipeline Analytics",
-        "🤖 Automation Status"
+        "📅 Meeting Intelligence",
+        "📊 Analytics",
+        "🤖 Automation"
     ])
     
     with tab1:
@@ -375,27 +586,31 @@ def main():
         with col1:
             st.subheader("📈 Pipeline Summary")
             if not metrics['by_stage'].empty:
-                # Show stage breakdown
-                for _, row in metrics['by_stage'].iterrows():
+                for _, row in metrics['by_stage'].head(5).iterrows():
                     st.write(f"**{row['Stage']}**: ${row['Total']:,.0f} ({row['Count']} deals)")
         
         with col2:
-            st.subheader("👥 Top Performers")
-            if not metrics['by_owner'].empty:
-                for _, row in metrics['by_owner'].head(5).iterrows():
-                    st.write(f"**{row['Owner']}**: ${row['Total']:,.0f} ({row['Count']} deals)")
+            st.subheader("📅 Recent Meetings")
+            if not meetings_df.empty:
+                recent_meetings = meetings_df.head(5)
+                for _, meeting in recent_meetings.iterrows():
+                    if meeting.get('Date') and meeting.get('Participants'):
+                        st.write(f"• {meeting['Date'][:10]}: {meeting['Participants'][:50]}...")
+            else:
+                st.info("No meeting data available")
         
         # Quick Actions
         st.subheader("🚀 Quick Actions")
         col1, col2, col3 = st.columns(3)
         with col1:
-            if st.button("📊 Refresh Pipeline Data"):
+            if st.button("🔄 Refresh All Data"):
                 st.cache_data.clear()
+                st.cache_resource.clear()
                 st.rerun()
         with col2:
-            st.button("📧 Check Salesforce Email")
+            st.button("📧 Process Salesforce Email")
         with col3:
-            st.button("📅 Today's Meetings")
+            st.button("📝 Generate Daily Report")
     
     with tab2:
         st.header("Salesforce Pipeline Analysis")
@@ -422,7 +637,7 @@ def main():
                 min_amount = st.number_input(
                     "Min Deal Size",
                     min_value=0,
-                    max_value=int(df['Amount'].max()),
+                    max_value=int(df['Amount'].max()) if df['Amount'].max() > 0 else 1000000,
                     value=0
                 )
             
@@ -436,28 +651,36 @@ def main():
             # Show filtered metrics
             st.write(f"**Showing {len(filtered_df)} of {len(df)} deals** | Total: ${filtered_df['Amount'].sum():,.0f}")
             
-            # Pipeline by Stage Chart
-            if not metrics['by_stage'].empty:
-                fig = px.bar(
-                    metrics['by_stage'],
-                    x='Stage',
-                    y='Total',
-                    title='Pipeline by Stage',
-                    labels={'Total': 'Amount ($)', 'Stage': 'Sales Stage'},
-                    color='Total',
-                    color_continuous_scale='Blues',
-                    text='Total'
-                )
-                fig.update_traces(texttemplate='$%{text:,.0f}', textposition='outside')
-                st.plotly_chart(fig, use_container_width=True)
+            # Charts
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if not metrics['by_stage'].empty:
+                    fig = px.bar(
+                        metrics['by_stage'],
+                        x='Stage',
+                        y='Total',
+                        title='Pipeline by Stage',
+                        labels={'Total': 'Amount ($)', 'Stage': 'Sales Stage'},
+                        text='Total'
+                    )
+                    fig.update_traces(texttemplate='$%{text:,.0f}', textposition='outside')
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                if not metrics['by_stage'].empty:
+                    fig = px.pie(
+                        metrics['by_stage'],
+                        values='Total',
+                        names='Stage',
+                        title='Pipeline Distribution'
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
             
             # Deal details table
             st.subheader("Deal Details")
-            
-            # Format the dataframe for display
             display_df = filtered_df.copy()
             display_df['Amount'] = display_df['Amount'].apply(lambda x: f"${x:,.0f}")
-            display_df = display_df.sort_values('Opportunity')
             
             st.dataframe(
                 display_df[['Opportunity', 'Account', 'Amount', 'Stage', 'Owner', 'Close_Date']],
@@ -465,146 +688,183 @@ def main():
                 hide_index=True
             )
             
-            # Export button
+            # Export
             csv = filtered_df.to_csv(index=False)
             st.download_button(
-                label="📥 Download Pipeline Data",
+                label="📥 Export Pipeline Data",
                 data=csv,
-                file_name=f"pipeline_{datetime.now().strftime('%Y%m%d')}.csv",
+                file_name=f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                 mime='text/csv'
             )
         else:
-            st.warning("No pipeline data available. Check connection settings or use Debug Mode.")
+            st.warning("No pipeline data available")
     
     with tab3:
-        st.header("Intelligence Search")
+        st.header("🔍 Intelligence Search")
+        st.info("Search across pipeline deals and meeting intelligence using natural language")
         
         # Search interface
-        search_query = st.text_input("🔍 Search across all data sources...", placeholder="e.g., 'deals closing this month' or 'Madison Communications'")
+        search_query = st.text_input(
+            "Ask anything about your business data...",
+            placeholder="e.g., 'What were the main themes from my meeting with Sanook?' or 'Show me all deals closing this month'"
+        )
         
-        if search_query:
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            search_type = st.radio(
+                "Search mode:",
+                ["AI-Powered (Smart)", "Basic (Keyword)"],
+                horizontal=True
+            )
+        with col2:
+            search_button = st.button("🔍 Search", type="primary")
+        
+        if search_query and search_button:
             with st.spinner("Searching..."):
-                # First, search in pipeline data
-                st.subheader("Pipeline Results")
-                pipeline_results = df[df.apply(lambda row: search_query.lower() in str(row).lower(), axis=1)] if not df.empty else pd.DataFrame()
-                
-                if not pipeline_results.empty:
-                    st.write(f"Found {len(pipeline_results)} deals matching '{search_query}':")
-                    display_results = pipeline_results.copy()
-                    display_results['Amount'] = display_results['Amount'].apply(lambda x: f"${x:,.0f}")
-                    st.dataframe(display_results[['Opportunity', 'Account', 'Amount', 'Stage', 'Owner']], use_container_width=True, hide_index=True)
+                if search_type == "AI-Powered (Smart)":
+                    results = search_with_ai(search_query)
                 else:
-                    st.info("No pipeline deals match your search")
+                    results = basic_search(search_query)
                 
-                # Vector search if configured
-                st.subheader("Knowledge Base Results")
-                kb_results = search_intelligence(search_query)
-                if kb_results:
-                    for result in kb_results:
-                        if isinstance(result, dict) and 'metadata' in result:
-                            with st.expander(f"📄 {result['metadata'].get('title', 'Result')} (Score: {result.get('score', 0):.2f})"):
-                                st.write(result['metadata'].get('content', 'No content'))
+                # Display results
+                st.subheader("Search Results")
+                if results:
+                    st.markdown(results)
                 else:
-                    st.info("Knowledge base search requires OpenAI and Pinecone configuration")
+                    st.info("No results found for your query")
+        
+        # Example queries
+        with st.expander("📝 Example Queries"):
+            st.markdown("""
+            **Pipeline Queries:**
+            - "Show me all deals closing this month"
+            - "What's the total pipeline for Qualified stage?"
+            - "Which deals are owned by Pragya?"
+            
+            **Meeting Queries:**
+            - "What were the main themes from today's meetings?"
+            - "Show me action items from meetings with Madison Communications"
+            - "Summarize yesterday's meeting notes"
+            
+            **Cross-functional:**
+            - "What's the status of the Sanook deal and our last meeting?"
+            - "Show me everything related to APAC region"
+            """)
     
     with tab4:
-        st.header("Pipeline Analytics")
+        st.header("📅 Meeting Intelligence")
         
-        if not df.empty:
-            col1, col2 = st.columns(2)
+        if not meetings_df.empty:
+            st.write(f"**Total Meetings Tracked:** {len(meetings_df)}")
             
-            with col1:
-                # Pipeline trend (mock data for now)
-                st.subheader("Pipeline Trend")
-                st.info("Historical trend analysis coming soon")
-                
-                # Top deals
-                st.subheader("Top 10 Deals")
+            # Recent meetings
+            st.subheader("Recent Meetings")
+            for _, meeting in meetings_df.head(10).iterrows():
+                with st.expander(f"{meeting.get('Date', 'Unknown Date')} - {meeting.get('Participants', 'Unknown')[:50]}"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write("**Notes:**")
+                        st.write(meeting.get('Notes', 'No notes')[:500])
+                    with col2:
+                        st.write("**Key Themes:**")
+                        st.write(meeting.get('Key_Themes', 'No themes'))
+                        st.write("**Action Items:**")
+                        st.write(meeting.get('Action_Items', 'No action items'))
+        else:
+            st.info("No meeting data available. Configure MEETING_DB_ID in secrets.")
+            st.code("""
+# Add to Streamlit Secrets:
+MEETING_DB_ID = "your-meeting-database-id"
+            """)
+    
+    with tab5:
+        st.header("📊 Analytics Dashboard")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Top deals
+            st.subheader("🏆 Top 10 Deals")
+            if not df.empty:
                 top_deals = df.nlargest(10, 'Amount')[['Opportunity', 'Account', 'Amount', 'Stage']]
                 top_deals['Amount'] = top_deals['Amount'].apply(lambda x: f"${x:,.0f}")
                 st.dataframe(top_deals, use_container_width=True, hide_index=True)
-            
-            with col2:
-                # Owner performance
-                st.subheader("Sales Rep Performance")
-                if not metrics['by_owner'].empty:
-                    fig = px.bar(
-                        metrics['by_owner'],
-                        x='Owner',
-                        y='Total',
-                        title='Pipeline by Sales Rep',
-                        labels={'Total': 'Pipeline ($)', 'Owner': 'Sales Rep'},
-                        text='Count'
-                    )
-                    fig.update_traces(texttemplate='%{text} deals', textposition='outside')
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                # Stage conversion
-                st.subheader("Stage Distribution")
-                if not metrics['by_stage'].empty:
-                    fig = px.pie(
-                        metrics['by_stage'],
-                        values='Total',
-                        names='Stage',
-                        title='Pipeline Distribution by Stage'
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            # Owner leaderboard
+            st.subheader("👥 Sales Leaderboard")
+            if not metrics['by_owner'].empty:
+                fig = px.bar(
+                    metrics['by_owner'],
+                    x='Owner',
+                    y='Total',
+                    title='Pipeline by Sales Rep',
+                    text='Count'
+                )
+                fig.update_traces(texttemplate='%{text} deals', textposition='outside')
+                st.plotly_chart(fig, use_container_width=True)
     
-    with tab5:
-        st.header("Automation Status")
+    with tab6:
+        st.header("🤖 Automation Status")
         
-        # Synology status
-        st.subheader("🖥️ Synology NAS")
         col1, col2 = st.columns(2)
+        
         with col1:
+            st.subheader("🖥️ Synology NAS")
             st.success("✅ Pipeline Processor: Active")
-            st.info("Last run: Today 6:00 AM")
-        with col2:
-            st.info(f"Processed: {len(df)} deals")
-            st.info("Next run: Tomorrow 6:00 AM")
+            st.info(f"Last sync: {len(df)} deals")
+            st.info("Schedule: Daily at 6:00 AM")
         
-        # Mac Mini status
-        st.subheader("💻 Mac Mini")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.warning("⚠️ Email Extraction: Manual")
-            st.info("Salesforce email arrives: 4:00 AM")
         with col2:
-            if st.button("📧 Setup Automation"):
+            st.subheader("💻 Mac Mini")
+            st.warning("⚠️ Email Extraction: Manual")
+            with st.expander("Setup Automation"):
                 st.code("""
 # Add to crontab:
 30 5 * * * /usr/bin/python3 ~/Desktop/sf_extraction/extract_salesforce_report.py
                 """, language="bash")
         
-        # Notion status
-        st.subheader("📝 Notion Integration")
-        st.success(f"✅ Connected: {len(df)} deals synced")
-        st.info(f"Database ID: {get_credentials().get('PIPELINE_DB_ID', 'Not set')}")
+        st.subheader("📊 Data Sources")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Notion Databases", "2 connected")
+            st.caption(f"Pipeline: {len(df)} records")
+            st.caption(f"Meetings: {len(meetings_df)} records")
+        
+        with col2:
+            creds = get_credentials()
+            openai_status = "✅" if creds and creds.get("OPENAI_API_KEY") else "❌"
+            st.metric("OpenAI", openai_status)
+            st.caption("For AI-powered search")
+        
+        with col3:
+            pinecone_status = "✅" if init_pinecone() else "❌"
+            st.metric("Pinecone", pinecone_status)
+            st.caption("For vector search")
     
-    # Sidebar - System Status
-    st.sidebar.header("🔧 System Status")
+    # Sidebar
+    st.sidebar.header("📊 System Overview")
     
     if df.empty:
         st.sidebar.error("❌ No pipeline data")
     else:
         st.sidebar.success(f"✅ {len(df)} deals loaded")
+        st.sidebar.info(f"💰 ${metrics['total_pipeline']:,.0f} total pipeline")
     
-    # Debug Info
+    if not meetings_df.empty:
+        st.sidebar.info(f"📅 {len(meetings_df)} meetings tracked")
+    
+    # Debug info
     if DEBUG_MODE:
-        st.sidebar.header("🔍 Debug Info")
+        st.sidebar.header("🔧 Debug Info")
         creds = get_credentials()
-        st.sidebar.write("**Credentials Status:**")
-        st.sidebar.write("- Notion Token:", "✅" if creds and creds.get("NOTION_TOKEN") else "❌")
+        st.sidebar.write("**Credentials:**")
+        st.sidebar.write("- Notion:", "✅" if creds and creds.get("NOTION_TOKEN") else "❌")
         st.sidebar.write("- Pipeline DB:", "✅" if creds and creds.get("PIPELINE_DB_ID") else "❌")
-        st.sidebar.write("- OpenAI Key:", "✅" if creds and creds.get("OPENAI_API_KEY") else "❌")
-        st.sidebar.write("- Pinecone Key:", "✅" if creds and creds.get("PINECONE_API_KEY") else "❌")
-        
-        if not df.empty:
-            st.sidebar.write("**Data Stats:**")
-            st.sidebar.write(f"- Total deals: {len(df)}")
-            st.sidebar.write(f"- Total value: ${df['Amount'].sum():,.0f}")
-            st.sidebar.write(f"- Unique stages: {df['Stage'].nunique()}")
-            st.sidebar.write(f"- Unique owners: {df['Owner'].nunique()}")
+        st.sidebar.write("- Meeting DB:", "✅" if creds and creds.get("MEETING_DB_ID") else "❌")
+        st.sidebar.write("- OpenAI:", "✅" if creds and creds.get("OPENAI_API_KEY") else "❌")
+        st.sidebar.write("- Pinecone:", "✅" if creds and creds.get("PINECONE_API_KEY") else "❌")
 
 if __name__ == "__main__":
     main()
