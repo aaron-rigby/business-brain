@@ -12,17 +12,6 @@ import traceback
 import time
 import json
 
-# Add logging
-import logging
-from datetime import datetime
-
-logging.basicConfig(
-    filename='/volume1/Shared/business_brain/logs/rag_update.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s'
-)
-
-logging.info(f"RAG Update Started: {datetime.now()}")
 # ============================================
 # PAGE CONFIGURATION
 # ============================================
@@ -37,39 +26,27 @@ st.set_page_config(
 # DEBUG MODE TOGGLE
 # ============================================
 DEBUG_MODE = st.sidebar.checkbox("🔧 Debug Mode", value=False)
-USE_HARDCODED = st.sidebar.checkbox("🔐 Use Hardcoded Credentials", value=False)
 
 # ============================================
 # CREDENTIAL MANAGEMENT
 # ============================================
 def get_credentials():
-    """Get credentials with fallback options"""
-    if USE_HARDCODED:
-        st.sidebar.info("Using hardcoded credentials")
+    """Get credentials from Streamlit secrets"""
+    try:
         return {
-            "NOTION_TOKEN": "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",
-            "PIPELINE_DB_ID": "24d6e7c238388037b0d1eb52ba9c2b29",
+            "NOTION_TOKEN": st.secrets.get("NOTION_TOKEN", ""),
+            "PIPELINE_DB_ID": st.secrets.get("PIPELINE_DB_ID", ""),
             "MEETING_DB_ID": st.secrets.get("MEETING_DB_ID", ""),
             "OPENAI_API_KEY": st.secrets.get("OPENAI_API_KEY", ""),
             "PINECONE_API_KEY": st.secrets.get("PINECONE_API_KEY", ""),
             "PINECONE_INDEX_NAME": st.secrets.get("PINECONE_INDEX_NAME", "business-brain"),
         }
-    else:
-        try:
-            return {
-                "NOTION_TOKEN": st.secrets.get("NOTION_TOKEN"),
-                "PIPELINE_DB_ID": st.secrets.get("PIPELINE_DB_ID"),
-                "MEETING_DB_ID": st.secrets.get("MEETING_DB_ID", ""),
-                "OPENAI_API_KEY": st.secrets.get("OPENAI_API_KEY", ""),
-                "PINECONE_API_KEY": st.secrets.get("PINECONE_API_KEY", ""),
-                "PINECONE_INDEX_NAME": st.secrets.get("PINECONE_INDEX_NAME", "business-brain"),
-            }
-        except Exception as e:
-            st.error(f"Failed to load secrets: {e}")
-            return None
+    except Exception as e:
+        st.error(f"Failed to load secrets: {e}")
+        return None
 
 # ============================================
-# NOTION CONNECTION - FIXED CACHING
+# NOTION CONNECTION
 # ============================================
 @st.cache_resource
 def get_notion_client():
@@ -104,6 +81,7 @@ def get_pipeline_history():
     database_id = creds.get("PIPELINE_DB_ID")
     
     if not database_id:
+        st.error("Pipeline database ID not found in secrets")
         return pd.DataFrame()
     
     try:
@@ -134,8 +112,8 @@ def get_pipeline_history():
             try:
                 props = item.get('properties', {})
                 
-                # Extract all fields
-                amount = props.get('Amount_USD', {}).get('number', 0) if props.get('Amount_USD', {}).get('number') else 0
+                # Extract all fields with safe defaults
+                amount = props.get('Amount_USD', {}).get('number', 0) or 0
                 
                 account = "Unknown"
                 if props.get('Account_Name', {}).get('rich_text'):
@@ -145,7 +123,6 @@ def get_pipeline_history():
                 if props.get('Stage', {}).get('select'):
                     stage = props.get('Stage', {}).get('select', {}).get('name', 'Unknown')
                 
-                # Get Date_Captured - CRITICAL
                 date_captured = None
                 if props.get('Date_Captured', {}).get('date'):
                     date_captured = props.get('Date_Captured', {}).get('date', {}).get('start', '')
@@ -162,8 +139,7 @@ def get_pipeline_history():
                 if props.get('Owner', {}).get('rich_text'):
                     owner = props.get('Owner', {}).get('rich_text', [{}])[0].get('plain_text', 'Unknown')
                 
-                # Get additional fields for analysis
-                probability = props.get('Probability', {}).get('number', 0) if props.get('Probability', {}).get('number') else 0
+                probability = props.get('Probability', {}).get('number', 0) or 0
                 
                 market = "Unknown"
                 if props.get('Market', {}).get('select'):
@@ -182,8 +158,8 @@ def get_pipeline_history():
                 })
                 
             except Exception as e:
-                if DEBUG_MODE and idx < 5:  # Only show first 5 errors
-                    st.write(f"⚠️ Error processing historical record {idx}: {e}")
+                if DEBUG_MODE and idx < 5:
+                    st.write(f"⚠️ Error processing record {idx}: {e}")
                 continue
         
         df = pd.DataFrame(deals)
@@ -191,6 +167,8 @@ def get_pipeline_history():
         if not df.empty:
             df['Date_Captured'] = pd.to_datetime(df['Date_Captured'], errors='coerce')
             df['Close_Date'] = pd.to_datetime(df['Close_Date'], errors='coerce')
+            # Clean up amounts - ensure no NaN values
+            df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
         
         return df
         
@@ -199,45 +177,40 @@ def get_pipeline_history():
         return pd.DataFrame()
 
 # ============================================
-# GET CURRENT PIPELINE DATA (LATEST SNAPSHOT ONLY)
+# GET CURRENT PIPELINE DATA (LATEST SNAPSHOT)
 # ============================================
 def get_pipeline_data():
     """Fetch current pipeline data (latest snapshot only)"""
-    # Get all historical data
     df_all = get_pipeline_history()
     
     if df_all.empty:
         return pd.DataFrame()
     
-    # Filter to latest capture date only
-    if 'Date_Captured' in df_all.columns:
-        df_all['Date_Captured'] = pd.to_datetime(df_all['Date_Captured'], errors='coerce')
-        
-        # Remove rows with invalid dates
-        df_all = df_all[df_all['Date_Captured'].notna()]
-        
-        if df_all.empty:
-            return pd.DataFrame()
-        
-        # Get the latest date
-        latest_date = df_all['Date_Captured'].max()
-        
-        # Filter for only the most recent snapshot
-        current_pipeline = df_all[df_all['Date_Captured'] == latest_date].copy()
-        
-        # Exclude ONLY closed/lost deals - everything else is active pipeline
-        excluded_stages = ['Closed Won', 'Closed Lost', 'Closed', 'Lost', 'Disqualified']
-        current_pipeline = current_pipeline[~current_pipeline['Stage'].isin(excluded_stages)]
-        
-        if DEBUG_MODE:
-            st.write(f"📅 Latest capture date: {latest_date.strftime('%Y-%m-%d')}")
-            st.write(f"📚 Total historical records: {len(df_all)}")
-            st.write(f"📈 Current pipeline: {len(current_pipeline)} deals")
-            st.write(f"💰 Current pipeline value: ${current_pipeline['Amount'].sum():,.0f}")
-        
-        return current_pipeline
+    if 'Date_Captured' not in df_all.columns:
+        return pd.DataFrame()
     
-    return df_all
+    df_all['Date_Captured'] = pd.to_datetime(df_all['Date_Captured'], errors='coerce')
+    df_all = df_all[df_all['Date_Captured'].notna()]
+    
+    if df_all.empty:
+        return pd.DataFrame()
+    
+    # Get the latest date
+    latest_date = df_all['Date_Captured'].max()
+    
+    # Filter for only the most recent snapshot
+    current_pipeline = df_all[df_all['Date_Captured'] == latest_date].copy()
+    
+    # Exclude ONLY closed/lost deals - everything else is active pipeline
+    excluded_stages = ['Closed Won', 'Closed Lost', 'Closed', 'Lost', 'Disqualified']
+    current_pipeline = current_pipeline[~current_pipeline['Stage'].isin(excluded_stages)]
+    
+    if DEBUG_MODE:
+        st.write(f"📅 Latest capture: {latest_date.strftime('%Y-%m-%d %H:%M')}")
+        st.write(f"📈 Current pipeline: {len(current_pipeline)} deals")
+        st.write(f"💰 Total value: ${current_pipeline['Amount'].sum():,.0f}")
+    
+    return current_pipeline
 
 # ============================================
 # TEMPORAL ANALYSIS FUNCTIONS
@@ -251,12 +224,10 @@ def calculate_deal_velocity():
     
     velocity_metrics = {}
     
-    # Group by opportunity to track stage changes
     for opp in df_history['Opportunity'].unique():
         opp_history = df_history[df_history['Opportunity'] == opp].sort_values('Date_Captured')
         
         if len(opp_history) > 1:
-            # Track stage changes
             for i in range(len(opp_history) - 1):
                 current = opp_history.iloc[i]
                 next_record = opp_history.iloc[i + 1]
@@ -269,10 +240,9 @@ def calculate_deal_velocity():
                         velocity_metrics[transition] = []
                     velocity_metrics[transition].append(days_between)
     
-    # Calculate averages
     avg_velocity = {}
     for transition, days_list in velocity_metrics.items():
-        if days_list:  # Only if we have data
+        if days_list:
             avg_velocity[transition] = {
                 'avg_days': np.mean(days_list),
                 'median_days': np.median(days_list),
@@ -290,14 +260,17 @@ def get_pipeline_trends():
     if df_history.empty:
         return pd.DataFrame(), {}
     
-    # Remove invalid dates
     df_history = df_history[df_history['Date_Captured'].notna()]
     
     if df_history.empty:
         return pd.DataFrame(), {}
     
+    # Exclude closed deals for trend analysis
+    excluded_stages = ['Closed Won', 'Closed Lost', 'Closed', 'Lost', 'Disqualified']
+    active_history = df_history[~df_history['Stage'].isin(excluded_stages)]
+    
     # Group by date to get daily snapshots
-    daily_pipeline = df_history.groupby('Date_Captured').agg({
+    daily_pipeline = active_history.groupby(active_history['Date_Captured'].dt.date).agg({
         'Amount': 'sum',
         'Opportunity': 'count'
     }).reset_index()
@@ -323,13 +296,11 @@ def get_win_loss_analysis():
     if df_history.empty:
         return {}
     
-    # Filter for closed deals only
     closed_deals = df_history[df_history['Stage'].isin(['Closed Won', 'Closed Lost'])]
     
     if closed_deals.empty:
         return {}
     
-    # Get latest status for each opportunity
     latest_status = closed_deals.sort_values('Date_Captured').groupby('Opportunity').last()
     
     won = len(latest_status[latest_status['Stage'] == 'Closed Won'])
@@ -350,7 +321,7 @@ def get_win_loss_analysis():
     }
 
 # ============================================
-# MEETING INTELLIGENCE DATA FETCHING
+# MEETING INTELLIGENCE
 # ============================================
 def get_meeting_intelligence():
     """Fetch meeting intelligence from Notion"""
@@ -365,7 +336,6 @@ def get_meeting_intelligence():
         return pd.DataFrame()
     
     try:
-        # Fetch all meeting records with pagination
         all_results = []
         has_more = True
         next_cursor = None
@@ -381,13 +351,11 @@ def get_meeting_intelligence():
             has_more = response.get('has_more', False)
             next_cursor = response.get('next_cursor', None)
         
-        # Process meeting records
         meetings = []
         for item in all_results:
             try:
                 props = item.get('properties', {})
                 
-                # Extract meeting data with flexible field names
                 meeting_date = None
                 for date_field in ['Meeting_Date', 'Date', 'When', 'Created_Date']:
                     if date_field in props and props[date_field].get('date'):
@@ -425,7 +393,7 @@ def get_meeting_intelligence():
         return pd.DataFrame()
 
 # ============================================
-# AI-POWERED SEARCH WITH OPENAI
+# AI-POWERED SEARCH
 # ============================================
 def search_with_ai(query):
     """Use OpenAI to search and summarize across all data sources"""
@@ -437,14 +405,11 @@ def search_with_ai(query):
     try:
         openai.api_key = creds["OPENAI_API_KEY"]
         
-        # Get relevant data
         pipeline_df = get_pipeline_data()
         meetings_df = get_meeting_intelligence()
         
-        # Build context
         context_parts = []
         
-        # Add pipeline context
         if not pipeline_df.empty:
             relevant_deals = pipeline_df[
                 pipeline_df.apply(lambda row: any(
@@ -456,7 +421,6 @@ def search_with_ai(query):
             if not relevant_deals.empty:
                 context_parts.append("RELEVANT DEALS:\n" + relevant_deals.to_string())
         
-        # Add meeting context
         if not meetings_df.empty:
             relevant_meetings = meetings_df[
                 meetings_df.apply(lambda row: any(
@@ -536,7 +500,10 @@ def calculate_metrics(df):
             'by_owner': pd.DataFrame(),
         }
     
-    # ALL non-closed deals are active pipeline
+    # Ensure Amount column is numeric
+    df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+    
+    # Calculate metrics for ALL deals (no filtering)
     total = df['Amount'].sum()
     num_deals = len(df)
     avg_size = total / num_deals if num_deals > 0 else 0
@@ -561,24 +528,22 @@ def calculate_metrics(df):
 # MAIN APPLICATION
 # ============================================
 def main():
-    # No title for minimal interface
-    
     # Fetch data
     with st.spinner("Loading data..."):
-        df = get_pipeline_data()  # Current snapshot only
-        df_history = get_pipeline_history()  # All historical data
+        df = get_pipeline_data()
+        df_history = get_pipeline_history()
         meetings_df = get_meeting_intelligence()
     
     # Calculate metrics
     metrics = calculate_metrics(df)
     
-    # Display main metrics
+    # Display main metrics - showing FULL pipeline
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric(
             "💰 Current Pipeline",
-            "${:,.0f}".format(metrics['total_pipeline']) if metrics['total_pipeline'] > 0 else "$0",
+            "${:,.0f}".format(metrics['total_pipeline']),
             delta=None
         )
     
@@ -592,12 +557,11 @@ def main():
     with col3:
         st.metric(
             "📊 Avg Deal Size",
-            "${:,.0f}".format(metrics['avg_deal_size']) if metrics['avg_deal_size'] > 0 else "$0",
+            "${:,.0f}".format(metrics['avg_deal_size']),
             delta=None
         )
     
     with col4:
-        # Show pipeline trend
         _, trend_metrics = get_pipeline_trends()
         if trend_metrics and 'wow_change' in trend_metrics:
             st.metric(
@@ -622,9 +586,7 @@ def main():
     with tab1:
         st.header("Daily Intelligence Brief")
         
-        # Add date selector for historical view (with error handling)
         if not df_history.empty and 'Date_Captured' in df_history.columns:
-            # Filter out NaT values and get valid dates
             valid_dates = df_history[df_history['Date_Captured'].notna()]['Date_Captured'].dt.date.unique()
             
             if len(valid_dates) > 0:
@@ -636,8 +598,10 @@ def main():
                     max_value=available_dates[0]
                 )
                 
-                # Show pipeline for selected date
-                selected_df = df_history[df_history['Date_Captured'].dt.date == selected_date]
+                selected_df = df_history[
+                    (df_history['Date_Captured'].dt.date == selected_date) &
+                    (~df_history['Stage'].isin(['Closed Won', 'Closed Lost', 'Closed', 'Lost', 'Disqualified']))
+                ]
                 if not selected_df.empty:
                     st.info(f"Pipeline on {selected_date}: ${selected_df['Amount'].sum():,.0f} ({len(selected_df)} deals)")
         
@@ -647,7 +611,7 @@ def main():
             st.subheader("📈 Pipeline by Stage")
             if not metrics['by_stage'].empty:
                 for _, row in metrics['by_stage'].head(5).iterrows():
-                    st.write(f"**{row['Stage']}**: ${row['Total']:,.0f} ({row['Count']} deals)")
+                    st.write(f"**{row['Stage']}**: ${row['Total']:,.0f} ({int(row['Count'])} deals)")
         
         with col2:
             st.subheader("🏆 Win/Loss Metrics")
@@ -657,7 +621,6 @@ def main():
                 st.write(f"Won: {win_loss['deals_won']} deals (${win_loss['won_amount']:,.0f})")
                 st.write(f"Lost: {win_loss['deals_lost']} deals (${win_loss['lost_amount']:,.0f})")
         
-        # Quick Actions
         st.subheader("🚀 Quick Actions")
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -673,16 +636,13 @@ def main():
     with tab2:
         st.header("Salesforce Pipeline Analysis")
         
-        # Show current snapshot info
         if not df_history.empty and 'Date_Captured' in df_history.columns:
             valid_dates = df_history[df_history['Date_Captured'].notna()]['Date_Captured']
             if not valid_dates.empty:
                 latest_date = valid_dates.max()
-                st.info(f"📅 Showing current pipeline snapshot from: {latest_date.strftime('%Y-%m-%d %H:%M')}")
-                st.info(f"Pipeline on {latest_date.strftime('%Y-%m-%d')}: ${metrics['total_pipeline']:,.0f} ({metrics['num_deals']} deals)")
+                st.info(f"📅 Current snapshot from: {latest_date.strftime('%Y-%m-%d %H:%M')}")
         
         if not df.empty:
-            # Filters
             col1, col2, col3 = st.columns(3)
             
             with col1:
@@ -707,7 +667,6 @@ def main():
                     value=0
                 )
             
-            # Apply filters
             filtered_df = df[
                 (df['Stage'].isin(stage_filter)) &
                 (df['Owner'].isin(owner_filter)) &
@@ -716,7 +675,6 @@ def main():
             
             st.write(f"**Showing {len(filtered_df)} of {len(df)} deals** | Total: ${filtered_df['Amount'].sum():,.0f}")
             
-            # Charts
             col1, col2 = st.columns(2)
             
             with col1:
@@ -742,11 +700,11 @@ def main():
                     )
                     st.plotly_chart(fig, use_container_width=True)
             
-            # Deal table
             st.subheader("Deal Details")
             display_df = filtered_df.copy()
             display_df['Amount'] = display_df['Amount'].apply(lambda x: f"${x:,.0f}")
             if 'Close_Date' in display_df.columns:
+                display_df['Close_Date'] = pd.to_datetime(display_df['Close_Date'], errors='coerce')
                 display_df['Close_Date'] = display_df['Close_Date'].dt.strftime('%Y-%m-%d').fillna('')
             
             st.dataframe(
@@ -755,7 +713,6 @@ def main():
                 hide_index=True
             )
             
-            # Export
             csv = filtered_df.to_csv(index=False)
             st.download_button(
                 label="📥 Export Current Pipeline",
@@ -818,6 +775,7 @@ def main():
             st.subheader("🏆 Top 10 Deals")
             if not df.empty:
                 top_deals = df.nlargest(10, 'Amount')[['Opportunity', 'Account', 'Amount', 'Stage']]
+                top_deals = top_deals.copy()
                 top_deals['Amount'] = top_deals['Amount'].apply(lambda x: f"${x:,.0f}")
                 st.dataframe(top_deals, use_container_width=True, hide_index=True)
         
@@ -840,7 +798,6 @@ def main():
         if df_history.empty:
             st.warning("No historical data available for temporal analysis")
         else:
-            # Pipeline trend over time
             st.subheader("Pipeline Trend")
             daily_pipeline, trend_metrics = get_pipeline_trends()
             
@@ -852,23 +809,8 @@ def main():
                     title='Pipeline Value Over Time',
                     labels={'Total_Amount': 'Pipeline ($)', 'Date': 'Date'}
                 )
-                fig.add_scatter(
-                    x=daily_pipeline['Date'],
-                    y=daily_pipeline['Deal_Count'] * 10000,  # Scale for visibility
-                    mode='lines',
-                    name='Deal Count (x10k)',
-                    yaxis='y2'
-                )
-                fig.update_layout(
-                    yaxis2=dict(
-                        title='Deal Count',
-                        overlaying='y',
-                        side='right'
-                    )
-                )
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # Week-over-week metrics
                 if trend_metrics:
                     col1, col2, col3 = st.columns(3)
                     with col1:
@@ -878,50 +820,25 @@ def main():
                     with col3:
                         st.metric("Week-over-Week", f"{trend_metrics['wow_change']:+.1f}%")
             
-            # Deal velocity analysis
             st.subheader("Deal Velocity Analysis")
             velocity = calculate_deal_velocity()
             
             if velocity:
-                # Create DataFrame for display
                 velocity_df = pd.DataFrame([
                     {
                         'Transition': transition,
                         'Avg Days': metrics['avg_days'],
                         'Median Days': metrics['median_days'],
-                        'Count': metrics['count'],
-                        'Min Days': metrics['min_days'],
-                        'Max Days': metrics['max_days']
+                        'Count': metrics['count']
                     }
                     for transition, metrics in velocity.items()
                 ])
                 
                 if not velocity_df.empty:
                     velocity_df = velocity_df.sort_values('Count', ascending=False)
-                    
-                    # Show top transitions
                     st.write("**Average Time Between Stage Changes:**")
                     for _, row in velocity_df.head(10).iterrows():
-                        st.write(f"• **{row['Transition']}**: {row['Avg Days']:.1f} days (n={row['Count']:.0f})")
-            else:
-                st.info("Not enough historical data to calculate deal velocity")
-            
-            # Stage progression analysis
-            st.subheader("Stage Progression Over Time")
-            if 'Date_Captured' in df_history.columns:
-                valid_history = df_history[df_history['Date_Captured'].notna()]
-                if not valid_history.empty:
-                    # Count deals by stage over time
-                    stage_progression = valid_history.groupby(['Date_Captured', 'Stage']).size().reset_index(name='Count')
-                    
-                    fig = px.area(
-                        stage_progression,
-                        x='Date_Captured',
-                        y='Count',
-                        color='Stage',
-                        title='Deal Distribution by Stage Over Time'
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
+                        st.write(f"• **{row['Transition']}**: {row['Avg Days']:.1f} days (n={int(row['Count'])})")
     
     with tab7:
         st.header("🤖 Automation Status")
