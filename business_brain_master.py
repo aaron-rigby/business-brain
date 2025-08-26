@@ -12,6 +12,17 @@ import traceback
 import time
 import json
 
+# Add logging
+import logging
+from datetime import datetime
+
+logging.basicConfig(
+    filename='/volume1/Shared/business_brain/logs/rag_update.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s'
+)
+
+logging.info(f"RAG Update Started: {datetime.now()}")
 # ============================================
 # PAGE CONFIGURATION
 # ============================================
