@@ -36,7 +36,7 @@ def get_credentials():
     if USE_HARDCODED:
         st.sidebar.info("Using hardcoded credentials")
         return {
-            "NOTION_TOKEN": "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",
+            "NOTION_TOKEN": "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",
             "PIPELINE_DB_ID": "24d6e7c238388037b0d1eb52ba9c2b29",
             "MEETING_DB_ID": st.secrets.get("MEETING_DB_ID", ""),
             "OPENAI_API_KEY": st.secrets.get("OPENAI_API_KEY", ""),
