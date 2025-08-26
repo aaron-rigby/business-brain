@@ -225,14 +225,14 @@ def get_pipeline_data():
         # Filter for only the most recent snapshot
         current_pipeline = df_all[df_all['Date_Captured'] == latest_date].copy()
         
-        # Exclude ONLY closed deals (keep all active deals including Prospected)
+        # Exclude ONLY closed/lost deals - everything else is active pipeline
         excluded_stages = ['Closed Won', 'Closed Lost', 'Closed', 'Lost', 'Disqualified']
         current_pipeline = current_pipeline[~current_pipeline['Stage'].isin(excluded_stages)]
         
         if DEBUG_MODE:
             st.write(f"📅 Latest capture date: {latest_date.strftime('%Y-%m-%d')}")
             st.write(f"📚 Total historical records: {len(df_all)}")
-            st.write(f"📈 Current active pipeline: {len(current_pipeline)} deals")
+            st.write(f"📈 Current pipeline: {len(current_pipeline)} deals")
             st.write(f"💰 Current pipeline value: ${current_pipeline['Amount'].sum():,.0f}")
         
         return current_pipeline
@@ -532,22 +532,14 @@ def calculate_metrics(df):
             'total_pipeline': 0,
             'num_deals': 0,
             'avg_deal_size': 0,
-            'active_pipeline': 0,
-            'active_deals': 0,
             'by_stage': pd.DataFrame(),
             'by_owner': pd.DataFrame(),
         }
     
-    # Calculate TOTAL pipeline (all deals)
+    # ALL non-closed deals are active pipeline
     total = df['Amount'].sum()
     num_deals = len(df)
     avg_size = total / num_deals if num_deals > 0 else 0
-    
-    # Calculate ACTIVE pipeline (excluding Prospected stage or deals with $0)
-    active_stages = ['Qualified', 'Contract Sent', 'Proposal Sent', 'Negotiation', 'Verbal Commit']
-    active_df = df[df['Stage'].isin(active_stages)]
-    active_pipeline = active_df['Amount'].sum()
-    active_deals = len(active_df)
     
     by_stage = df.groupby('Stage')['Amount'].agg(['sum', 'count']).reset_index()
     by_stage.columns = ['Stage', 'Total', 'Count']
@@ -561,8 +553,6 @@ def calculate_metrics(df):
         'total_pipeline': total,
         'num_deals': num_deals,
         'avg_deal_size': avg_size,
-        'active_pipeline': active_pipeline,
-        'active_deals': active_deals,
         'by_stage': by_stage,
         'by_owner': by_owner,
     }
@@ -582,21 +572,21 @@ def main():
     # Calculate metrics
     metrics = calculate_metrics(df)
     
-    # Display main metrics - NOW SHOWING TOTAL PIPELINE
+    # Display main metrics
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric(
-            "💰 Total Pipeline",
+            "💰 Current Pipeline",
             "${:,.0f}".format(metrics['total_pipeline']) if metrics['total_pipeline'] > 0 else "$0",
-            delta=f"{metrics['num_deals']} deals" if metrics['num_deals'] > 0 else None
+            delta=None
         )
     
     with col2:
         st.metric(
-            "🎯 Active Pipeline",
-            "${:,.0f}".format(metrics['active_pipeline']) if metrics['active_pipeline'] > 0 else "$0",
-            delta=f"{metrics['active_deals']} deals" if metrics['active_deals'] > 0 else None
+            "🎯 Active Deals",
+            metrics['num_deals'],
+            delta=None
         )
     
     with col3:
@@ -689,15 +679,9 @@ def main():
             if not valid_dates.empty:
                 latest_date = valid_dates.max()
                 st.info(f"📅 Showing current pipeline snapshot from: {latest_date.strftime('%Y-%m-%d %H:%M')}")
+                st.info(f"Pipeline on {latest_date.strftime('%Y-%m-%d')}: ${metrics['total_pipeline']:,.0f} ({metrics['num_deals']} deals)")
         
         if not df.empty:
-            # Show both total and active pipeline
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Total Pipeline (All Stages)", f"${metrics['total_pipeline']:,.0f}")
-            with col2:
-                st.metric("Active Pipeline (Qualified+)", f"${metrics['active_pipeline']:,.0f}")
-            
             # Filters
             col1, col2, col3 = st.columns(3)
             
@@ -985,10 +969,8 @@ def main():
     if df.empty:
         st.sidebar.error("❌ No current pipeline data")
     else:
-        st.sidebar.success(f"✅ {len(df)} total deals")
-        st.sidebar.info(f"💰 ${metrics['total_pipeline']:,.0f} total pipeline")
-        st.sidebar.info(f"🎯 ${metrics['active_pipeline']:,.0f} active pipeline")
-        st.sidebar.info(f"📊 {metrics['active_deals']} active deals")
+        st.sidebar.success(f"✅ {len(df)} active deals")
+        st.sidebar.info(f"💰 ${metrics['total_pipeline']:,.0f} pipeline")
     
     if not df_history.empty:
         st.sidebar.info(f"📚 {len(df_history)} historical records")
