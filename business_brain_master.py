@@ -195,18 +195,21 @@ def get_pipeline_data():
     if df_all.empty:
         return pd.DataFrame()
     
-    # Get the latest date
-    latest_date = df_all['Date_Captured'].max()
+    # Get the latest DATE (not timestamp) to handle multiple snapshots per day
+    latest_date = df_all['Date_Captured'].dt.date.max()
     
-    # Filter for only the most recent snapshot
-    current_pipeline = df_all[df_all['Date_Captured'] == latest_date].copy()
+    # Get ALL records from that DATE (not exact timestamp)
+    current_pipeline = df_all[df_all['Date_Captured'].dt.date == latest_date].copy()
+    
+    # Remove duplicates - keep the one with highest amount per opportunity
+    current_pipeline = current_pipeline.sort_values('Amount', ascending=False).drop_duplicates('Opportunity', keep='first')
     
     # Exclude ONLY closed/lost deals - everything else is active pipeline
     excluded_stages = ['Closed Won', 'Closed Lost', 'Closed', 'Lost', 'Disqualified']
     current_pipeline = current_pipeline[~current_pipeline['Stage'].isin(excluded_stages)]
     
     if DEBUG_MODE:
-        st.write(f"📅 Latest capture: {latest_date.strftime('%Y-%m-%d %H:%M')}")
+        st.write(f"📅 Latest capture date: {latest_date}")
         st.write(f"📈 Current pipeline: {len(current_pipeline)} deals")
         st.write(f"💰 Total value: ${current_pipeline['Amount'].sum():,.0f}")
     
@@ -269,8 +272,12 @@ def get_pipeline_trends():
     excluded_stages = ['Closed Won', 'Closed Lost', 'Closed', 'Lost', 'Disqualified']
     active_history = df_history[~df_history['Stage'].isin(excluded_stages)]
     
+    # Group by date, remove duplicates per day
+    active_history['DateOnly'] = active_history['Date_Captured'].dt.date
+    daily_data = active_history.sort_values('Amount', ascending=False).drop_duplicates(['DateOnly', 'Opportunity'], keep='first')
+    
     # Group by date to get daily snapshots
-    daily_pipeline = active_history.groupby(active_history['Date_Captured'].dt.date).agg({
+    daily_pipeline = daily_data.groupby('DateOnly').agg({
         'Amount': 'sum',
         'Opportunity': 'count'
     }).reset_index()
@@ -602,6 +609,9 @@ def main():
                     (df_history['Date_Captured'].dt.date == selected_date) &
                     (~df_history['Stage'].isin(['Closed Won', 'Closed Lost', 'Closed', 'Lost', 'Disqualified']))
                 ]
+                # Remove duplicates for selected date display
+                selected_df = selected_df.sort_values('Amount', ascending=False).drop_duplicates('Opportunity', keep='first')
+                
                 if not selected_df.empty:
                     st.info(f"Pipeline on {selected_date}: ${selected_df['Amount'].sum():,.0f} ({len(selected_df)} deals)")
         
@@ -635,12 +645,6 @@ def main():
     
     with tab2:
         st.header("Salesforce Pipeline Analysis")
-        
-        if not df_history.empty and 'Date_Captured' in df_history.columns:
-            valid_dates = df_history[df_history['Date_Captured'].notna()]['Date_Captured']
-            if not valid_dates.empty:
-                latest_date = valid_dates.max()
-                st.info(f"📅 Current snapshot from: {latest_date.strftime('%Y-%m-%d %H:%M')}")
         
         if not df.empty:
             col1, col2, col3 = st.columns(3)
