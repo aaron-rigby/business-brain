@@ -273,6 +273,8 @@ def get_pipeline_trends():
     active_history = df_history[~df_history['Stage'].isin(excluded_stages)]
     
     # Group by date, remove duplicates per day
+    active_history['Date_Captured'] = pd.to_datetime(active_history['Date_Captured'], errors='coerce')
+    active_history = active_history[active_history['Date_Captured'].notna()]
     active_history['DateOnly'] = active_history['Date_Captured'].dt.date
     daily_data = active_history.sort_values('Amount', ascending=False).drop_duplicates(['DateOnly', 'Opportunity'], keep='first')
     
