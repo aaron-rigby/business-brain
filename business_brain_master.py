@@ -189,6 +189,7 @@ def get_pipeline_data():
     if 'Date_Captured' not in df_all.columns:
         return pd.DataFrame()
     
+    # Ensure Date_Captured is datetime
     df_all['Date_Captured'] = pd.to_datetime(df_all['Date_Captured'], errors='coerce')
     df_all = df_all[df_all['Date_Captured'].notna()]
     
@@ -224,6 +225,10 @@ def calculate_deal_velocity():
     
     if df_history.empty:
         return {}
+    
+    # Ensure Date_Captured is datetime
+    df_history['Date_Captured'] = pd.to_datetime(df_history['Date_Captured'], errors='coerce')
+    df_history = df_history[df_history['Date_Captured'].notna()]
     
     velocity_metrics = {}
     
@@ -263,6 +268,8 @@ def get_pipeline_trends():
     if df_history.empty:
         return pd.DataFrame(), {}
     
+    # Ensure Date_Captured is datetime
+    df_history['Date_Captured'] = pd.to_datetime(df_history['Date_Captured'], errors='coerce')
     df_history = df_history[df_history['Date_Captured'].notna()]
     
     if df_history.empty:
@@ -270,11 +277,12 @@ def get_pipeline_trends():
     
     # Exclude closed deals for trend analysis
     excluded_stages = ['Closed Won', 'Closed Lost', 'Closed', 'Lost', 'Disqualified']
-    active_history = df_history[~df_history['Stage'].isin(excluded_stages)]
+    active_history = df_history[~df_history['Stage'].isin(excluded_stages)].copy()
+    
+    if active_history.empty:
+        return pd.DataFrame(), {}
     
     # Group by date, remove duplicates per day
-    active_history['Date_Captured'] = pd.to_datetime(active_history['Date_Captured'], errors='coerce')
-    active_history = active_history[active_history['Date_Captured'].notna()]
     active_history['DateOnly'] = active_history['Date_Captured'].dt.date
     daily_data = active_history.sort_values('Amount', ascending=False).drop_duplicates(['DateOnly', 'Opportunity'], keep='first')
     
@@ -310,6 +318,8 @@ def get_win_loss_analysis():
     if closed_deals.empty:
         return {}
     
+    # Ensure Date_Captured is datetime for sorting
+    closed_deals['Date_Captured'] = pd.to_datetime(closed_deals['Date_Captured'], errors='coerce')
     latest_status = closed_deals.sort_values('Date_Captured').groupby('Opportunity').last()
     
     won = len(latest_status[latest_status['Stage'] == 'Closed Won'])
@@ -596,10 +606,14 @@ def main():
         st.header("Daily Intelligence Brief")
         
         if not df_history.empty and 'Date_Captured' in df_history.columns:
-            valid_dates = df_history[df_history['Date_Captured'].notna()]['Date_Captured'].dt.date.unique()
+            # Ensure Date_Captured is datetime before using .dt accessor
+            df_history['Date_Captured'] = pd.to_datetime(df_history['Date_Captured'], errors='coerce')
+            valid_dates_df = df_history[df_history['Date_Captured'].notna()]
             
-            if len(valid_dates) > 0:
+            if not valid_dates_df.empty:
+                valid_dates = valid_dates_df['Date_Captured'].dt.date.unique()
                 available_dates = sorted(valid_dates, reverse=True)
+                
                 selected_date = st.date_input(
                     "View pipeline for date:",
                     value=available_dates[0],
@@ -856,6 +870,8 @@ def main():
             if df_history.empty:
                 st.error("❌ No data received")
             else:
+                # Ensure Date_Captured is datetime
+                df_history['Date_Captured'] = pd.to_datetime(df_history['Date_Captured'], errors='coerce')
                 valid_dates = df_history[df_history['Date_Captured'].notna()]['Date_Captured']
                 if not valid_dates.empty:
                     latest_capture = valid_dates.max()
@@ -870,6 +886,8 @@ def main():
         
         st.subheader("📊 Data Quality Check")
         if not df_history.empty and 'Date_Captured' in df_history.columns:
+            # Ensure datetime conversion
+            df_history['Date_Captured'] = pd.to_datetime(df_history['Date_Captured'], errors='coerce')
             valid_history = df_history[df_history['Date_Captured'].notna()]
             if not valid_history.empty:
                 col1, col2, col3 = st.columns(3)
@@ -898,6 +916,8 @@ def main():
     if not df_history.empty:
         st.sidebar.info(f"📚 {len(df_history)} historical records")
         if 'Date_Captured' in df_history.columns:
+            # Ensure datetime conversion
+            df_history['Date_Captured'] = pd.to_datetime(df_history['Date_Captured'], errors='coerce')
             valid_dates = df_history[df_history['Date_Captured'].notna()]['Date_Captured'].dt.date.nunique()
             st.sidebar.info(f"📅 {valid_dates} days of data")
     
